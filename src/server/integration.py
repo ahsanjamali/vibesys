@@ -116,6 +116,8 @@ _CONTROL_EVENT_TYPES = frozenset(
         CoreEventType.PAUSE_REQUESTED,
         CoreEventType.RESUMED,
         CoreEventType.STOP_REQUESTED,
+        CoreEventType.PARK_REQUESTED,
+        CoreEventType.PARKED,
         CoreEventType.STEER_CONSUMED,
         CoreEventType.STEER_DELIVERED_MID_TURN,
         CoreEventType.STEER_DROPPED,
@@ -459,6 +461,10 @@ class RunIntegrationAdapter:
 
     def project_event(self, event: CoreEvent) -> None:
         """Project one core event onto server tracking state and the wire journal."""
+        if event.type is CoreEventType.INTENT_STATE:
+            # The additive run.log owns outcomes; legacy control events still
+            # update the existing frontend through _CONTROL_EVENT_TYPES.
+            return
         if event.type in _CONTROL_EVENT_TYPES:
             self._project_control_event(event)
             return
@@ -517,6 +523,8 @@ class RunIntegrationAdapter:
             CoreEventType.PAUSE_REQUESTED: self.controller.pause_after_call,
             CoreEventType.RESUMED: self.controller.resume,
             CoreEventType.STOP_REQUESTED: self.controller.stop_after_call,
+            CoreEventType.PARK_REQUESTED: self.controller.stop_after_call,
+            CoreEventType.PARKED: self.controller.land_stop_at_boundary,
             CoreEventType.STEER_CONSUMED: lambda: self.controller.record_steer_consumed(
                 agent_kind=event.agent_kind,
                 round_label=event.round_label,

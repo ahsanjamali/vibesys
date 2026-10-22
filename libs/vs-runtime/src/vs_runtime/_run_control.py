@@ -8,13 +8,21 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from vs_core.api import PauseOwner, RunPause, StopMode, escalate_stop
-from vs_runtime._operator_control import ControlAction, SteerMode, SteerTarget, action_summary
+from vs_agent.api import AgentExecutionCancelledError
+from vs_core.api import PauseOwner, RunPause, StopMode, TurnPermit, escalate_stop
+from vs_runtime._operator_control import (
+    ControlAction,
+    PauseNowRequest,
+    PauseRequest,
+    SteerMode,
+    SteerTarget,
+    action_summary,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from vs_core.api import CapacityHold
+    from vs_core.api import CapacityHold, Scope
     from vs_runtime._operator_control import ActionRequest
     from vs_sim.api import Threads
 
@@ -26,6 +34,7 @@ class RunControlTransitionKind(StrEnum):
     GUIDANCE_QUEUED = "guidance_queued"
     """A standing steer was queued: guidance in force until withdrawn, not one turn's."""
     PAUSE_REQUESTED = "pause_requested"
+    PARK_REQUESTED = "park_requested"
     RESUMED = "resumed"
     STOP_REQUESTED = "stop_requested"
     STEER_CONSUMED = "steer_consumed"
@@ -420,7 +429,7 @@ class RunControlChannel(Protocol):
         """Drain queued withdrawals exactly once."""
         ...
 
-    def queue_action(self, request: ActionRequest) -> None:
+    def queue_action(self, request: ActionRequest | PauseRequest | PauseNowRequest) -> None:
         """Queue an operator action for the run loop to take at its next control poll.
 
         The run loop drains actions (:meth:`take_pending_actions`) in the order they were
@@ -431,8 +440,12 @@ class RunControlChannel(Protocol):
         """
         ...
 
-    def take_pending_actions(self) -> list[ActionRequest]:
+    def take_pending_actions(self) -> list[ActionRequest | PauseRequest | PauseNowRequest]:
         """Drain queued operator actions exactly once."""
+        ...
+
+    def land_park(self, jobs: tuple[str, ...] = (), *, immediate: bool = False) -> None:
+        """Report that core committed a park drain."""
         ...
 
     def notify_action_applied(self, summary: str) -> None:
@@ -499,6 +512,61 @@ class RunControlChannel(Protocol):
         since (``control_id`` no longer names it). The quota pause and a pending stop are not
         an operator's request and stay.
         """
+        ...
+
+    def prepare_evaluation(
+        self, resource_id: str, scope: Scope, permit: TurnPermit | None = None
+    ) -> None:
+        """Identify an evaluation requested by an admitted turn, rather than the strategy.
+
+        ``permit`` is the logical-turn permit core issued. The drain gate checks it
+        and does not decide admission itself.
+        """
+        ...
+
+    def evaluation_is_dependency(self, resource_id: str) -> bool:
+        """Whether an executing turn still owns this evaluation dependency."""
+        ...
+
+    def prepare_execution(
+        self, execution_id: str, scope: Scope, permit: TurnPermit | None = None
+    ) -> None:
+        """Associate the turn's execution identity with its declared owner.
+
+        ``permit`` is the logical-turn permit core issued for this execution.
+        """
+        ...
+
+    def finish_execution(self, execution_id: str) -> None:
+        """Release the authority of a turn that finished executing."""
+        ...
+
+    def holds_permit(self, key: str) -> bool:
+        """Whether ``key`` was prepared with a logical-turn permit core issued."""
+        ...
+
+    def start_execution(
+        self,
+        started: Callable[[], None],
+        *,
+        execution_id: str | None = None,
+        evaluation_id: str | None = None,
+    ) -> None:
+        """Publish a dispatch under the same lock as the pause drain.
+
+        After the drain closes execution, a start is allowed only when its
+        execution or evaluation was prepared with a permit. The channel does
+        not decide which work was admitted.
+        """
+        ...
+
+    @property
+    def drain_ready(self) -> bool:
+        """Every queued job has been fenced or positively observed executing."""
+        ...
+
+    def settle_drain_job(self, resource_id: str) -> None:
+        """Release the queue barrier for this job."""
         ...
 
     def wait_while_paused(self) -> None:
@@ -664,7 +732,7 @@ class RuntimeRunControlChannel:
         self._lock = threads.condition(threads.rlock())
         self._pending_steer: list[QueuedSteer] = []
         self._pending_withdrawals: list[QueuedWithdraw] = []
-        self._pending_actions: list[ActionRequest] = []
+        self._pending_actions: list[ActionRequest | PauseRequest | PauseNowRequest] = []
         self._held = False
         self._quota_paused = False
         self._stop_requested = False
@@ -676,6 +744,12 @@ class RuntimeRunControlChannel:
         # A capacity wait core recorded before a restart: the next capacity stop takes it.
         self._capacity_standing = False
         self._stop_listeners: list[Callable[[], object]] = []
+        self._execution_closed = False
+        self._permits: dict[str, TurnPermit] = {}
+        self._prepared_executions: dict[str, Scope] = {}
+        self._evaluation_dependencies: dict[str, frozenset[str]] = {}
+        self._executing: dict[str, Scope] = {}
+        self._drain_jobs: set[str] = set()
         self._now = threads.now
         self._capacity_turns = 0
         self._timed_turns = 0
@@ -687,6 +761,82 @@ class RuntimeRunControlChannel:
         # a quota pause armed one, and always ``None`` under the operator's hold.
         self._resume_at: float | None = None
         self._resumed_by = PauseWake.RESUMED
+
+    def prepare_evaluation(
+        self, resource_id: str, scope: Scope, permit: TurnPermit | None = None
+    ) -> None:
+        """Capture the executing callers once; a later turn cannot inherit their queued jobs.
+
+        A permit is recorded only on the first prepare. A later turn cannot attach
+        its permit to an evaluation an earlier turn already requested.
+        """
+        with self._lock:
+            first = resource_id not in self._evaluation_dependencies
+            self._evaluation_dependencies.setdefault(
+                resource_id,
+                frozenset(key for key, owner in self._executing.items() if owner == scope),
+            )
+            if first and permit is not None:
+                self._permits[resource_id] = permit
+
+    def evaluation_is_dependency(self, resource_id: str) -> bool:
+        """A turn that requested this evaluation must still be executing."""
+        with self._lock:
+            owners = self._evaluation_dependencies.get(resource_id, frozenset())
+            return not self._stop_requested and not owners.isdisjoint(self._executing)
+
+    def prepare_execution(
+        self, execution_id: str, scope: Scope, permit: TurnPermit | None = None
+    ) -> None:
+        """Associate dispatch identity with its declared owner before preparation ends."""
+        with self._lock:
+            self._prepared_executions[execution_id] = scope
+            if permit is not None:
+                self._permits[execution_id] = permit
+
+    def holds_permit(self, key: str) -> bool:
+        """Whether ``key`` was prepared with a logical-turn permit."""
+        with self._lock:
+            return key in self._permits
+
+    def finish_execution(self, execution_id: str) -> None:
+        """Release this execution's dependency authority after the provider returns."""
+        with self._lock:
+            self._prepared_executions.pop(execution_id, None)
+            self._executing.pop(execution_id, None)
+
+    def start_execution(
+        self,
+        started: Callable[[], None],
+        *,
+        execution_id: str | None = None,
+        evaluation_id: str | None = None,
+    ) -> None:
+        """Publish dispatch atomically with the pause drain, when its permit says so."""
+        with self._lock:
+            allowed = not self._stop_requested and not self._execution_closed
+            if not allowed and not self._stop_requested:
+                key = execution_id if execution_id is not None else evaluation_id
+                allowed = key is not None and key in self._permits
+            if not allowed:
+                message = "pause drain cancelled preparation before execution"
+                raise AgentExecutionCancelledError(message)
+            if execution_id is not None:
+                scope = self._prepared_executions.pop(execution_id, None)
+                if scope is not None:
+                    self._executing[execution_id] = scope
+            started()
+
+    @property
+    def drain_ready(self) -> bool:
+        """Queued jobs have either ended or been positively observed already executing."""
+        with self._lock:
+            return not self._drain_jobs
+
+    def settle_drain_job(self, resource_id: str) -> None:
+        """Release a queued-job barrier for the run's next control poll."""
+        with self._lock:
+            self._drain_jobs.discard(resource_id)
 
     @property
     def _paused(self) -> bool:
@@ -972,17 +1122,28 @@ class RuntimeRunControlChannel:
             pending, self._pending_withdrawals = self._pending_withdrawals, []
         return pending
 
-    def queue_action(self, request: ActionRequest) -> None:
+    def queue_action(self, request: ActionRequest | PauseRequest | PauseNowRequest) -> None:
         """Queue an operator action for the run loop to take at its next control poll."""
         with self._lock:
             self._pending_actions.append(request)
-            self._emit(RunControlTransitionKind.ACTION_QUEUED, text=action_summary(request))
+            if not isinstance(request, PauseRequest | PauseNowRequest):
+                self._emit(RunControlTransitionKind.ACTION_QUEUED, text=action_summary(request))
 
-    def take_pending_actions(self) -> list[ActionRequest]:
+    def take_pending_actions(self) -> list[ActionRequest | PauseRequest | PauseNowRequest]:
         """Drain operator actions queued since the previous control poll."""
         with self._lock:
             pending, self._pending_actions = self._pending_actions, []
         return pending
+
+    def land_park(self, jobs: tuple[str, ...] = (), *, immediate: bool = False) -> None:
+        """Report core's accepted drain, after it is persisted."""
+        with self._lock:
+            self._execution_closed = True
+            if immediate:
+                self._executing.clear()
+                self._permits.clear()
+            self._drain_jobs.update(jobs)
+            self._emit(RunControlTransitionKind.PARK_REQUESTED)
 
     def notify_action_applied(self, summary: str) -> None:
         """Record that core recorded an operator action, so it applied."""

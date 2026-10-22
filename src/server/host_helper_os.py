@@ -8,7 +8,7 @@ is light (``tests/architecture/test_light_entrypoints.py``).
 
 Public surface: ``FileProjects``, ``ProjectStopIntents``, ``OsDirectories``,
 ``SubprocessRunLauncher``,
-``SubprocessRunPreflight``, ``LoginStarter`` with ``LoginBounds`` and ``login_instruction``,
+``SubprocessRunPreflight``, ``LoginStarter`` and ``HeldLogin`` with ``LoginBounds`` and ``login_instruction``,
 ``read_task_goal``,
 ``GitCheckoutProbe``, ``OsConfigFiles``, and ``StoreLogReader`` with ``run_streams_directory``.
 """
@@ -67,11 +67,13 @@ from server.host_helper_requests import (
     event_page,
 )
 from server.host_preflight import PreflightReport
+from server.host_run_events import EVENT_TYPES_BY_KINDS, RunEventKinds
 from server.run_digest import digest_journal
 from server.span_index import (
     Entry,
     JournalIndex,
     StaleIndexError,
+    kind_page,
     load_journal_index,
     read_documents,
     span_page,
@@ -315,6 +317,32 @@ class FileProjects:
             nothing = EventPage((), from_sequence, complete=True)
             return replace(nothing, total_events=0, total_bytes=0) if with_totals else nothing
         return replace(page, total_events=tally.lines, total_bytes=tally.size)
+
+    def run_kind_events(
+        self, project: Path, run_id: str, kinds: RunEventKinds, from_sequence: int, limit: int
+    ) -> EventPage:
+        """A page of the events ``kinds`` selects, from the journal's span index (``kind_page``).
+
+        The events carry the cursor the index gives them, as the span and tail reads' do, so they
+        are the same whether the index came from its sidecar or from a scan of the journal.
+        """
+
+        def ask(index: JournalIndex) -> tuple[list[Entry], tuple[int, int, int, bool]]:
+            entries, events, size, complete, next_sequence = kind_page(
+                index, EVENT_TYPES_BY_KINDS[kinds], from_sequence, limit, RUN_EVENTS_READ_MAX_BYTES
+            )
+            return entries, (next_sequence, events, size, complete)
+
+        (next_sequence, events, size, complete), documents = self._indexed_read(
+            self._journal(project, run_id), ask
+        )
+        return EventPage(
+            tuple(documents),
+            next_sequence,
+            complete=complete,
+            total_events=events,
+            total_bytes=size,
+        )
 
     def _journal(self, project: Path, run_id: str) -> Path:
         """The journal of ``run_id``, found through the project's run history once per channel.
@@ -813,6 +841,37 @@ class LoginBounds:
     """How long a login may stay open before it is ended."""
 
 
+class HeldLogin:
+    """A login that stays up until it ends or ``cancel`` stops its process group."""
+
+    def __init__(
+        self,
+        threads: Threads,
+        result: LoginStarted | LoginUnavailable,
+        process: PipedProcess | None,
+    ) -> None:
+        """Remember ``result`` and, when ``process`` is running, when it has been reaped."""
+        self.result = result
+        self._process = process
+        self._finished = threads.event()
+        if process is None:
+            self._finished.set()
+
+    def cancel(self) -> None:
+        """Stop the login's process group. A login that never started is unchanged."""
+        process = self._process
+        if process is not None:
+            process.terminate_group()
+
+    def wait(self) -> None:
+        """Block until the login process has been reaped."""
+        self._finished.wait()
+
+    def mark_finished(self) -> None:
+        """Record that the process group has been reaped."""
+        self._finished.set()
+
+
 class LoginStarter:
     """Runs a login command and reports what it asked the person to do."""
 
@@ -835,13 +894,27 @@ class LoginStarter:
 
     def start(self, argv: tuple[str, ...]) -> LoginStarted | LoginUnavailable:
         """Run ``argv`` and answer once it has shown its page and code, ended, or run out of time."""
+        return self.hold(argv).result
+
+    def refuse(self, result: LoginUnavailable) -> HeldLogin:
+        """A login that was not started, already finished."""
+        return HeldLogin(self._threads, result, None)
+
+    def hold(self, argv: tuple[str, ...]) -> HeldLogin:
+        """Start ``argv`` and keep the child until ``HeldLogin.cancel`` or its lifetime ends."""
         try:
             process = self._processes.start(argv, env=self._environment(), merge_stderr=True)
         except OSError as error:
-            return _failed(f"could not run {argv[0]}: {error.strerror or error}")
+            return HeldLogin(
+                self._threads, _failed(f"could not run {argv[0]}: {error.strerror or error}"), None
+            )
         output = _Output(self._threads)
+        held = HeldLogin(self._threads, LoginStarted(instruction=None), process)
         self._threads.spawn(lambda: _read(process, output), name="login-output")
-        self._threads.spawn(lambda: _reap(process, self._bounds.lifetime), name="login-reaper")
+        self._threads.spawn(
+            lambda: _reap(process, self._bounds.lifetime, held.mark_finished),
+            name="login-reaper",
+        )
         with output.condition:
             output.condition.wait_for(
                 lambda: output.url is not None or output.ended, self._bounds.page_wait
@@ -852,8 +925,10 @@ class LoginStarter:
                 )
             instruction = login_instruction(output.url, output.code)
             if instruction is None and output.url is None and output.ended and output.first_line:
-                return _failed(output.first_line)
-        return LoginStarted(instruction=instruction)
+                held.result = _failed(output.first_line)
+                return held
+        held.result = LoginStarted(instruction=instruction)
+        return held
 
 
 def _failed(detail: str) -> LoginUnavailable:
@@ -871,7 +946,7 @@ def _read(process: PipedProcess, output: _Output) -> None:
         output.end()
 
 
-def _reap(process: PipedProcess, lifetime: float) -> None:
+def _reap(process: PipedProcess, lifetime: float, finished: Callable[[], None]) -> None:
     """Wait for the child so it is reaped, and end its group if it outlives ``lifetime``."""
     try:
         process.wait(lifetime)
@@ -882,3 +957,5 @@ def _reap(process: PipedProcess, lifetime: float) -> None:
         except ProcessTimeoutError:
             process.kill_group()
             process.wait(5.0)
+    finally:
+        finished()

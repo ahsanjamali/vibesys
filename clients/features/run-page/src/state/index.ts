@@ -1,13 +1,20 @@
 /**
  * The Run screen's pure state: its store (`runPageStep`, a reducer with request tokens), the run
  * at the view (`createRunReader`), the zoom (`zoomMachine` over a `Route`), and the selectors the
- * screen renders: header, stop, quota and ended banners, the startup timeline, the run level's
+ * screen renders: header, pause and ended banners, the startup timeline, the run level's
  * hero, chart, ideas and Now, the logs, and the scrubber (`scrubberView`) over the trace log.
  */
 
 export type {UsageRecord} from '@vibesys/contracts/host-helper';
 export {ideaOfAttempt} from './attempt-ideas.js';
 export {type BaselineColumns, baselineColumns} from './baselines.js';
+export {
+  type GatewayEvent,
+  type GatewayInput,
+  type GatewayLogInput,
+  type GatewayRunContext,
+  gatewayRunMachine,
+} from './gateway-machine.js';
 export {type HistoryLoadingView, historyLoadingView} from './history-words.js';
 export {type IdeaBase, type IdeaBases, ideaBases} from './idea-bases.js';
 export {effectWords, type IdeaEffect, type IdeaEffects, ideaEffects} from './idea-effects.js';
@@ -38,7 +45,13 @@ export {
   pressChip,
 } from './ideas-view.js';
 export type {GateFailure} from './input-gates.js';
-export {EMPTY_TRACE_LOG, type RunData, type SessionView, type TraceLog} from './live.js';
+export {
+  EMPTY_TRACE_LOG,
+  isTraceEventType,
+  type RunData,
+  type SessionView,
+  type TraceLog,
+} from './live.js';
 export {type ModelNames, modelNamesOf, NO_MODEL_NAMES} from './model-names.js';
 export {roleLabel, stepKicker, stepLabel, stepTitle} from './names.js';
 export {
@@ -71,7 +84,6 @@ export {createRunReader, type RunModel} from './run-model.js';
 export {
   type HistoryProgress,
   type HistoryReply,
-  type ResumeWhen,
   type RunPageAction,
   type RunPageRequest,
   type RunPageSeed,
@@ -88,6 +100,13 @@ export {
 } from './run-page.js';
 export {type SummaryReply, summaryFacts, type WireSummary} from './run-summary.js';
 export {scrubberView, viewAtPosition} from './scrub.js';
+export {
+  projectSkeleton,
+  recordedRunRoot,
+  skeletonPositions,
+  skeletonScreenState,
+} from './skeleton-projection.js';
+export {adoptionTitles} from './span-words.js';
 export {spendOf, tokensByAgent, turnTokens} from './token-usage.js';
 export {
   type TokensCell,
@@ -142,10 +161,9 @@ export {
   historyProblem,
   machineBlockWords,
   type Offer,
-  quotaBannerView,
+  pauseNowBannerView,
   runEnding,
   runGoneWords,
-  stopBannerView,
   streamLines,
   type TraceArrival,
   timelineView,

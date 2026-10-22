@@ -47,8 +47,8 @@ class ControlAction(StrEnum):
 
     STEER = "steer"
     PAUSE = "pause"
+    PAUSE_NOW = "pause_now"
     RESUME = "resume"
-    STOP = "stop"
     WITHDRAW = "withdraw"
     CANCEL_ATTEMPT = "cancel_attempt"
     CANCEL_ITEM = "cancel_item"
@@ -133,12 +133,6 @@ class WithdrawRequest(_Request):
     """The ``control_id`` of the standing steer to end."""
 
 
-class PauseRequest(_Request):
-    """Reach the next safe boundary and hold the run there."""
-
-    action: Literal[ControlAction.PAUSE] = ControlAction.PAUSE
-
-
 def check_one_way_to_resume(*, fallback: bool, when: ResumeWhen) -> None:
     """Raise ``ValueError`` if a resume both switches to the fallback and waits for capacity.
 
@@ -147,6 +141,13 @@ def check_one_way_to_resume(*, fallback: bool, when: ResumeWhen) -> None:
     if fallback and when == "capacity_returns":
         message = "fallback resumes now; it cannot wait for capacity to return"
         raise ValueError(message)
+
+
+class PauseRequest(_Request):
+    """Finish turns in flight, release evaluation jobs, save and exit for relaunch."""
+
+    action: Literal[ControlAction.PAUSE] = ControlAction.PAUSE
+    expected_epoch: Annotated[int, Field(ge=0)] | None = None
 
 
 class ResumeRequest(_Request):
@@ -168,11 +169,11 @@ class ResumeRequest(_Request):
         return self
 
 
-class StopRequest(_Request):
-    """End the run, draining or cancelling the work in flight."""
+class PauseNowRequest(_Request):
+    """Cancel unfinished work and exit; saved work remains resumable."""
 
-    action: Literal[ControlAction.STOP] = ControlAction.STOP
-    mode: StopMode = StopMode.DRAIN
+    action: Literal[ControlAction.PAUSE_NOW] = ControlAction.PAUSE_NOW
+    expected_epoch: Annotated[int, Field(ge=0)] | None = None
 
 
 class CancelAttemptRequest(_Request):
@@ -242,8 +243,8 @@ def action_summary(request: ActionRequest) -> str:
 type ControlRequest = Annotated[
     SteerRequest
     | PauseRequest
+    | PauseNowRequest
     | ResumeRequest
-    | StopRequest
     | WithdrawRequest
     | CancelAttemptRequest
     | CancelItemRequest
@@ -423,14 +424,11 @@ class ChannelRunControl:
             case WithdrawRequest(withdraws=withdraws, control_id=control_id):
                 self._channel.queue_withdraw(withdraws, control_id)
                 status = ControlStatus.PENDING
-            case PauseRequest(control_id=control_id):
-                self._channel.request_pause(control_id)
+            case PauseRequest() | PauseNowRequest():
+                self._channel.queue_action(request)
                 status = ControlStatus.PENDING
             case ResumeRequest():
                 status, reason = self._resume(request)
-            case StopRequest(mode=mode, control_id=control_id):
-                self._channel.request_stop(mode, control_id)
-                status = ControlStatus.PENDING
             case CancelAttemptRequest() | CancelItemRequest() | SetMaxParallelRequest():
                 self._channel.queue_action(request)
                 status = ControlStatus.PENDING
@@ -509,6 +507,7 @@ __all__ = [
     "ControlAction",
     "ControlRequest",
     "ControlStatus",
+    "PauseNowRequest",
     "PauseRequest",
     "RefusalReason",
     "ResumeRequest",
@@ -519,7 +518,6 @@ __all__ = [
     "SteerTarget",
     "SteerTargetKind",
     "StopMode",
-    "StopRequest",
     "SubjectId",
     "WithdrawRequest",
     "action_subject",

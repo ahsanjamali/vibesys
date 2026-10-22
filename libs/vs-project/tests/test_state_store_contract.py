@@ -9,7 +9,7 @@ from threading import Barrier
 from typing import TYPE_CHECKING, cast
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 from pydantic import ValidationError
 
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
             self,
             root: Path,
             /,
-            faults: tuple[CommitFault, ...] = (),
+            faults: tuple[CommitFault | None, ...] = (),
             *,
             lease_faults: tuple[CommitFault | None, ...] = (),
             observation_faults: tuple[ObservationFault | None, ...] = (),
@@ -51,7 +51,7 @@ if TYPE_CHECKING:
 
 def _fake(
     _root: Path,
-    faults: tuple[CommitFault, ...] = (),
+    faults: tuple[CommitFault | None, ...] = (),
     *,
     lease_faults: tuple[CommitFault | None, ...] = (),
     observation_faults: tuple[ObservationFault | None, ...] = (),
@@ -65,7 +65,7 @@ def _fake(
 
 def _local(
     root: Path,
-    faults: tuple[CommitFault, ...] = (),
+    faults: tuple[CommitFault | None, ...] = (),
     *,
     lease_faults: tuple[CommitFault | None, ...] = (),
     observation_faults: tuple[ObservationFault | None, ...] = (),
@@ -171,6 +171,24 @@ def test_conflict_does_not_consume_fault_plan(make_store: StoreFactory, tmp_path
     assert isinstance(store.commit(1, _envelope(2), fence, now=1), Conflict)
     assert store.commit(None, _envelope(0), fence, now=2) == Unknown(revision=0)
     assert store.load() == _envelope(0)
+
+
+@given(successful=st.integers(min_value=0, max_value=8))
+def test_fault_plan_can_select_a_later_commit(make_store: StoreFactory, successful: int) -> None:
+    with TemporaryDirectory() as directory:
+        store = make_store(Path(directory), (None,) * successful + (CommitFault.UNKNOWN_AFTER,))
+        fence = store.acquire("host-a", now=0, duration=10)
+        assert fence is not None
+        revision = None
+        for index in range(successful + 1):
+            candidate = _envelope(index)
+            outcome = store.commit(revision, candidate, fence, now=1)
+            expected = (
+                Unknown(revision=index) if index == successful else Committed(record=candidate)
+            )
+            assert outcome == expected
+            assert store.load() == candidate
+            revision = index
 
 
 def test_fence_renewal_expiry_and_takeover(make_store: StoreFactory, tmp_path: Path) -> None:
@@ -776,3 +794,28 @@ def test_a_document_from_a_newer_release_names_both_versions(
 
     with pytest.raises(StateDocumentDamagedError, match=rf"version {newer}.*reads version {read}"):
         store.commit(None, _envelope(0), fence, now=1)
+
+
+@pytest.mark.regression
+@given(payload=st.binary(max_size=1024))
+@example(payload=b"busy run")
+def test_observation_reads_the_whole_published_record_inside_a_writer_transaction(
+    make_store: StoreFactory, payload: bytes
+) -> None:
+    with TemporaryDirectory() as directory:
+        store = make_store(Path(directory))
+        assert store.observe() is None
+        fence = store.acquire("host-a", now=0, duration=100)
+        assert fence is not None
+        envelope = _envelope(0, payload)
+        assert store.commit(None, envelope, fence, now=1) == Committed(record=envelope)
+        observed = []
+        assert store.mutate_if_fenced(
+            fence, now=2, mutation=lambda: observed.append(store.observe())
+        )
+        assert observed == [envelope]
+        quarantine = QuarantinedEnvelope(
+            revision=1, schema_version=1, payload=payload, reason="blocked"
+        )
+        assert store.quarantine(0, quarantine, fence, now=3) == Committed(record=quarantine)
+        assert store.observe() == quarantine

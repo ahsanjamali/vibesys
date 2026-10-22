@@ -426,6 +426,7 @@ class _ProductHostFactory:
             CoreResources(
                 run_id=project.state.run_id,
                 project=project.project,
+                resuming=project.resuming,
                 facts=resources.facts,
                 options=self.options,
                 workspaces=workspaces,
@@ -437,6 +438,7 @@ class _ProductHostFactory:
                         workspaces,
                         clock=self.timing.clock,
                         stage_output=stage_output,
+                        control=self.integration.control,
                     ),
                     self.request.config.evaluation.evaluation_retries(),
                     project.project.state.local_namespace(
@@ -452,6 +454,7 @@ class _ProductHostFactory:
                     if spec.model and spec.model != base.model
                 },
                 agent_turns=turns,
+                control=self.integration.control,
                 invocation_slot=invocations,
                 configuration=configuration,
                 clock=self.timing.clock,
@@ -471,8 +474,9 @@ class _ProductHostFactory:
                 # events stay ungrouped until this path carries its own
                 # per-attempt identity to pass through here.
                 local_validation_events=CoreLocalValidationEvents(self.integration.events),
-                measurement_observer=CoreMeasurementEvents(self.integration.events),
+                measurement_observer=CoreMeasurementEvents(self.integration.events, decisions),
                 measurement_decisions=decisions,
+                epoch=lambda: self.integration.events.epoch,
                 commit_observer=self.integration.core_commit_observer(
                     project.state.run_id, self.projector, self.plugin.id
                 ),
@@ -637,6 +641,7 @@ class _ProductHostFactory:
             ledger_identity=ledger_identity,
             stage_output=stage_output,
             root_proof=cluster.root_proof,
+            control=self.integration.control,
         )
 
     async def stop_new_work(self) -> None:

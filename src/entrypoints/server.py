@@ -53,9 +53,10 @@ from server.runtime import (
     WebSocketBindError,
     browser_origin,
 )
-from vibesys.api import ConfigurationError
+from vibesys.api import ConfigurationError, RunRequest, RunStatus
 from vs_project.api import (
     Project,
+    ProjectRootNotFoundError,
     ProjectStateError,
     create_operator_key,
     user_runtime_root,
@@ -119,7 +120,8 @@ def _termination_signal(
     CPython runs Python handlers on the main thread only, so a handler installed
     for SIGTERM is not run while the main thread is blocked in the run. *relay*
     observes the signal on whichever thread took it, then *wake* interrupts the main
-    thread, resent until the main thread has taken it (see ``MainThreadInterrupt``).
+    thread, resent until the scope ends so discarded interruptions can be recovered
+    (see ``MainThreadInterrupt``).
     """
 
     def on_wake() -> None:
@@ -129,6 +131,7 @@ def _termination_signal(
     with ExitStack() as scope:
         send = scope.enter_context(wake.armed(on_wake))
         interrupt = MainThreadInterrupt(send, threads, _report_stuck_main_thread)
+        scope.enter_context(interrupt.recovering())
 
         def on_signal(signum: int) -> None:
             number = Signals(signum)
@@ -140,7 +143,13 @@ def _termination_signal(
         scope.enter_context(
             relay.relay([Signals.SIGINT, Signals.SIGTERM, Signals.SIGHUP], on_signal)
         )
-        yield
+        # Keep the callback as a backstop if the first interruption lands in the
+        # finally suite itself. Both disarm requests before the relay joins them.
+        scope.callback(interrupt.finish)
+        try:
+            yield
+        finally:
+            interrupt.finish()
 
 
 def _control_socket_from_argv(argv: list[str]) -> Path | None:
@@ -267,7 +276,7 @@ def _chat_reader_opener(
         return None
 
     def open_reader() -> RunReader:
-        request = cli.build_run_request(cli.parse_cli_invocation(["--resume", run_id]))
+        request = cli.build_reader_request(Path.cwd(), run_id)
         return run_readers(request)
 
     return open_reader
@@ -359,6 +368,12 @@ class _DetachedGatewayEffects:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+
+    def spawn_python(
+        self, module: str, arguments: list[str], environment: dict[str, str], output: BinaryIO
+    ) -> _DetachedProcess:
+        """Launch a framework child with the same installed interpreter as this host."""
+        return self.spawn([sys.executable, "-m", module, *arguments], environment, output)
 
     def discover(self, instance_path: Path) -> WebInstanceRecord | None:
         return self._discovery.discover(instance_path, cleanup_stale=False)
@@ -467,11 +482,7 @@ def _start_detached_child[T](launch: _DetachedLaunch[T], effects: _DetachedGatew
     launch's output as stdout and stderr.
     """
     environment = {**os.environ, "VIBESYS_DETACHED_CHILD": "1"}
-    process = effects.spawn(
-        [sys.executable, "-m", launch.module, *launch.arguments],
-        environment,
-        launch.output,
-    )
+    process = effects.spawn_python(launch.module, launch.arguments, environment, launch.output)
     deadline = effects.monotonic() + _DETACHED_START_HANG_GUARD_SECONDS
     while effects.monotonic() < deadline:
         value = launch.ready()
@@ -1003,6 +1014,23 @@ def main(
         raise SystemExit(1) from None
 
 
+def _opened_project_root(request: RunRequest) -> Path | None:
+    """The opened project's root when its directory exists.
+
+    A fresh collection destination does not exist until the run provisions it.
+    The server publishes that root from the run-ready fact, which is
+    ``Project.root`` after ``Project.open``. ``resolved_project_root`` is the
+    request's root, including None when a caller has not named one.
+    """
+    root = request.resolved_project_root
+    if root is None:
+        return None
+    try:
+        return Project.open(root).root
+    except ProjectRootNotFoundError:
+        return None
+
+
 def _serve(  # noqa: C901, PLR0912, PLR0915  # lint-waiver: LW-101031 [C901, PLR0912, PLR0915]; the entrypoint owns ordered setup, parsing, execution, and cleanup branches
     arguments: list[str],
     observer: ServerLifecycleObserver | None,
@@ -1089,13 +1117,17 @@ def _serve(  # noqa: C901, PLR0912, PLR0915  # lint-waiver: LW-101031 [C901, PLR
             if read_only_log is not None
             else cli.build_run_request(cli.parse_cli_invocation(_headless_argv(arguments)))
         )
-        if observer is not None and request is not None:
-            observer.resolved(
-                project_root=request.project_root,
-                task=request.input_bundle.task_name,
-            )
+        opened_root = None if request is None else _opened_project_root(request)
+        if observer is not None and request is not None and opened_root is not None:
+            observer.resolved(project_root=opened_root, task=request.input_bundle.task_name)
         run_id = None if request is None else request.resolved_run_id
-        project_root = None if request is None else request.resolved_project_root
+        project_root = (
+            None
+            if request is None
+            else opened_root
+            if opened_root is not None
+            else request.resolved_project_root
+        )
         server_runtime = import_module("server.runtime").ServerRuntime
         open_reader = (
             None
@@ -1121,6 +1153,7 @@ def _serve(  # noqa: C901, PLR0912, PLR0915  # lint-waiver: LW-101031 [C901, PLR
                 instance_path=instance_path,
                 detach=detach,
                 read_only_log=read_only_log,
+                observer=observer,
                 open_reader=open_reader,
                 platform=platform,
             )
@@ -1149,7 +1182,7 @@ def _serve(  # noqa: C901, PLR0912, PLR0915  # lint-waiver: LW-101031 [C901, PLR
     # `result` is `None` when `ServerRuntime.run` absorbed an operator stop
     # (`RunStopped`) as a clean backend exit; only a completed run's
     # `RunResult.succeeded` decides the process exit code.
-    if result is not None and not result.succeeded:
+    if result is not None and not result.succeeded and result.status is not RunStatus.PARKED:
         raise SystemExit(1)
 
 

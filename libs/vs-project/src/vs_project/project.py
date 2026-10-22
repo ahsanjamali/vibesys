@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
@@ -14,13 +15,15 @@ from vs_project._layout import (
     TaskName,
     TasksRoot,
 )
-from vs_project._state import ProjectState
+from vs_project._state import ProjectState, _state_home, validate_run_id
+from vs_project._state_io import publish_run_link
 from vs_project._state_store import LocalStateStore
 from vs_sim.api import ProcessTimeoutError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+    from vs_project._admission import FileAdmissionStore
     from vs_project._git_process import Git
     from vs_project._state_io import StoreDurabilityEffects
     from vs_project.api.state_store import (
@@ -79,7 +82,7 @@ class Project:
         self,
         run_id: str,
         *,
-        fault_plan: Iterable[CommitFault] = (),
+        fault_plan: Iterable[CommitFault | None] = (),
         lease_fault_plan: Iterable[CommitFault | None] = (),
         observation_fault_plan: Iterable[ObservationFault | None] = (),
         effects: StoreDurabilityEffects | None = None,
@@ -122,6 +125,14 @@ class Project:
         ):
             return None
         return self.state_store(run_id).load()
+
+    @staticmethod
+    def admissions(*, home: Path | None = None) -> FileAdmissionStore:
+        """Open this host user's retained admissions, independent of any project root."""
+        user_home = home or Path.home()
+        return import_module("vs_project._admission").FileAdmissionStore(
+            user_home / ".vibesys" / "admissions" / "v1", durable_root=user_home
+        )
 
     def is_initialized(self) -> bool:
         """Return whether this project has repository-native task configuration."""
@@ -186,6 +197,46 @@ class Project:
     def log_directory_for(cls, project_root: Path | str, run_id: str) -> Path:
         """Return a run log destination, including before a root is materialized."""
         return ProjectState.log_directory_for(project_root, run_id)
+
+    @classmethod
+    def run_log_path_for(cls, project_root: Path | str, run_id: str) -> Path:
+        """Return the transport log beside the authoritative JSONL journal."""
+        return cls.log_directory_for(project_root, run_id) / "run.log"
+
+    @classmethod
+    def chat_session_directory_for(
+        cls, project_root: Path | str, run_id: str, session_id: str
+    ) -> Path:
+        """A run-owned chat session, retained with the run's log directory."""
+        return ProjectState.chat_session_directory_for(project_root, run_id, session_id)
+
+    @classmethod
+    def run_blobs_directory_for(cls, project_root: Path | str, run_id: str) -> Path:
+        """Return immutable run-transport content, beside the authoritative journal."""
+        return cls.log_directory_for(project_root, run_id) / "blobs"
+
+    @classmethod
+    def event_journal_path_for(cls, project_root: Path | str, run_id: str) -> Path:
+        """Return the authoritative core-event journal for one run."""
+        return cls.log_directory_for(project_root, run_id) / "core-events.jsonl"
+
+    @classmethod
+    def publish_run_for(cls, project_root: Path | str, run_id: str) -> Path:
+        """Atomically publish a host discovery link to this run's log directory."""
+        validate_run_id(run_id)
+        return publish_run_link(
+            _state_home() / "runs" / run_id, cls.log_directory_for(project_root, run_id)
+        )
+
+    @staticmethod
+    def indexed_run_directories() -> tuple[Path, ...]:
+        """List all host discovery entries, including damaged and dangling entries.
+
+        Maintenance callers must report unsupported entries rather than silently
+        ignoring them. No state or index is created by this read.
+        """
+        index = _state_home() / "runs"
+        return tuple(sorted(index.iterdir())) if index.is_dir() else ()
 
     @classmethod
     def logged_run_ids_for(cls, project_root: Path | str) -> tuple[str, ...]:

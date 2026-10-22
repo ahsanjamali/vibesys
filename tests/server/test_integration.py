@@ -46,6 +46,7 @@ from vibesys.events import (
     GateKind,
     InputMeasurementFailedData,
     InputMeasurementFailureKind,
+    IntentStateData,
     InvocationFinishedData,
     PhaseData,
     QuotaPausedData,
@@ -165,6 +166,7 @@ def _attach_test_run(
         cast("RunSession", _FakeRunSession(auxiliary)),
         RunReady(
             record=run_record(project, run_id),
+            project_root=project.root,
             log_directory=log_dir,
             frontend_state_directory=project.state.local_namespace(
                 run_id, "server"
@@ -281,6 +283,19 @@ def test_a_quota_pause_reaches_the_wire_journal_under_the_active_execution(
     assert paused.agent_kind == "implementer"
     assert paused.data is not None
     assert paused.data.kind == "quota_paused"
+
+
+def test_native_intent_outcomes_do_not_enter_the_legacy_wire_journal(tmp_path: Path) -> None:
+    parts = build_server_parts(tmp_path)
+    before = parts.journal.read()
+    parts.core_events.emit(
+        CoreEventType.INTENT_STATE,
+        data=IntentStateData(
+            state_json='{"controlId":"pause-a","action":"INTENT_ACTION_PAUSE","step":"INTENT_STEP_APPLIED"}'
+        ),
+    )
+    assert parts.journal.read() == before
+    parts.integration.close()
 
 
 def test_framework_events_bypass_execution_stamping_and_lift_warnings(tmp_path: Path) -> None:
@@ -926,6 +941,7 @@ def test_partially_started_chat_cleanup_survives_a_diagnostic_write_failure(
     auxiliary = TrackingAuxiliaryAgents()
     ready = RunReady(
         record=run_record(project, run_id),
+        project_root=project.root,
         log_directory=log_dir,
         frontend_state_directory=project.state.local_namespace(
             run_id, "server"
@@ -1055,3 +1071,12 @@ def test_a_turns_typed_reply_is_data_on_the_executions_finish_event(tmp_path: Pa
         if event.type is EventType.AGENT_EXECUTION_FINISHED
     ]
     assert [getattr(data, "reply", None) for data in finished] == [reply]
+
+
+def test_pause_drain_events_use_legacy_control_bookkeeping(tmp_path: Path) -> None:
+    parts = build_server_parts(tmp_path)
+    parts.controller.ready()
+    parts.core_events.emit(CoreEventType.PARK_REQUESTED)
+    parts.core_events.emit(CoreEventType.PARKED)
+    assert parts.api.snapshot().status.value == "stopped"
+    assert any(event.type is EventType.CONTROL for event in parts.journal.read())

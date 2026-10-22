@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
 
 import pytest
+from hypothesis import example, given
+from hypothesis import strategies as st
+from protobuf.wkt.google.protobuf.wrappers_pb import StringValue
 from tests.support.container_credentials import set_container_cli_credentials
 from tests.support.core_plugins import core_policy
 from tests.support.docker_environment import fake_docker_environment, host_container_backend
@@ -20,6 +25,7 @@ from vibesys.api.testing import FakeProfilerPreflight
 from vibesys.composition import resolve_agent_specs
 from vibesys.config import AgentCfg, Config
 from vibesys.constants import ComputeBackend
+from vibesys.events import CoreEventType
 from vibesys.inputs import load_task
 from vibesys.orchestration.profilers import ProfilerKind, ProfilerPreflightResult
 from vibesys.plugin_registration import OrchestrationRegistration
@@ -40,6 +46,7 @@ from vs_core.api import (
     validate_startup,
 )
 from vs_project.api import OrchestrationDescriptor, Project, StoredEnvelope
+from vs_runlog.api import RunLogReader
 from vs_runtime.api import (
     AgentRole,
     CorePlan,
@@ -56,7 +63,6 @@ from vs_sim.api.testing import ManualClock, SimThreads, VirtualClock, run_virtua
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
     from vibesys.run.core_services import CoreServices
     from vs_agent.api import AgentClientProtocol, CapacityGate
@@ -145,6 +151,7 @@ def _open(
     client_factory: Callable[..., AgentClientProtocol] | None,
     journal: bool,
     config: Config | None = None,
+    emitted: tuple[str, ...] = (),
 ) -> Callable[[], CoreServices]:
     project_root = tmp_path / "project"
     templates = tmp_path / "templates"
@@ -177,6 +184,8 @@ def _open(
                 network=UnixNetwork(),
                 profiler_preflight=FakeProfilerPreflight(),
             ) as host:
+                for text in emitted:
+                    integration.events.emit(CoreEventType.FRAMEWORK_WARNING, text)
                 return host.services
         finally:
             integration.close()
@@ -456,3 +465,37 @@ def test_run_plugin_drives_a_core_policy_through_the_shell(tmp_path: Path) -> No
     assert isinstance(stored, StoredEnvelope)
     core = json.loads(stored.payload)["envelope"]["core"]["run"]
     assert (core["status"], core["result"]["outcome"]) == ("terminal", "failure")
+
+
+@pytest.mark.regression
+@given(texts=st.lists(st.text(max_size=24), max_size=5))
+@example(texts=["live"])
+@example(texts=["\x85"])
+def test_core_host_tees_startup_and_live_events(texts: list[str]) -> None:
+    with TemporaryDirectory() as directory, pytest.MonkeyPatch.context() as environ:
+        root = Path(directory)
+        environ.setenv("VIBESYS_STATE_HOME", str(root / "state"))
+        _open(root, client_factory=_resumable_client, journal=True, emitted=tuple(texts))()
+        project_root = root / "project"
+        (run_id,) = Project.logged_run_ids_for(project_root)
+        journal = Project.event_journal_path_for(project_root, run_id).read_text().split("\n")[:-1]
+        with Project.run_log_path_for(project_root, run_id).open("rb") as stream:
+            records = list(RunLogReader(stream))
+        assert records[0].body is not None
+        assert records[0].body.field == "epoch_started"
+        assert any(
+            record.body is not None and record.body.field == "lifecycle" for record in records
+        )
+        assert all(
+            record.body is not None and record.body.field != "legacy_event" for record in records
+        )
+        notices = [
+            StringValue.from_binary(record.body.value.detail.value).value
+            if record.body.value.detail is not None
+            else record.body.value.message
+            for record in records
+            if record.body is not None and record.body.field == "notice"
+        ]
+        if texts:
+            assert notices[-len(texts) :] == texts
+            assert [json.loads(line)["text"] for line in journal[-len(texts) :]] == texts

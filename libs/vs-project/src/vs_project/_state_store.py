@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from vs_project._state_io import AtomicWriteEffects, AtomicWriteStream, StoreDurabilityEffects
+    from vs_project.api.state_store import StoreRecord
     from vs_project.project import Project
 
 
@@ -100,7 +101,7 @@ class FakeStateStore(StoreOperations):
     def __init__(
         self,
         *,
-        fault_plan: Iterable[CommitFault] = (),
+        fault_plan: Iterable[CommitFault | None] = (),
         lease_fault_plan: Iterable[CommitFault | None] = (),
         observation_fault_plan: Iterable[ObservationFault | None] = (),
     ) -> None:
@@ -140,6 +141,12 @@ class FakeStateStore(StoreOperations):
     def _transaction(self) -> Iterator[None]:
         with self._lock:
             yield
+
+    def observe(self) -> StoreRecord | None:
+        """Inspect atomic bytes without joining a writer's transaction."""
+        source = self._contents.get(StoreFile.RECORD)
+        document = None if source is None else self._records.decode(source)
+        return None if document is None else document.record
 
     def _read_record(self) -> StoreDocument | None:
         source = self._read_file(StoreFile.RECORD)
@@ -202,7 +209,7 @@ class LocalStateStore(StoreOperations):
         project: Project,
         run_id: str,
         *,
-        fault_plan: Iterable[CommitFault] = (),
+        fault_plan: Iterable[CommitFault | None] = (),
         lease_fault_plan: Iterable[CommitFault | None] = (),
         observation_fault_plan: Iterable[ObservationFault | None] = (),
         effects: StoreDurabilityEffects | None = None,
@@ -238,6 +245,12 @@ class LocalStateStore(StoreOperations):
             yield
         finally:
             os.close(descriptor)
+
+    def observe(self) -> StoreRecord | None:
+        """Inspect the atomic replacement without a lease lock or durability repair."""
+        source = self._namespace.read_bytes(StoreFile.RECORD)
+        document = None if source is None else self._records.decode(source)
+        return None if document is None else document.record
 
     def _read_record(self) -> StoreDocument | None:
         source = self._read_file(StoreFile.RECORD)

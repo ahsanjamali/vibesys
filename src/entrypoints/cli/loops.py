@@ -365,7 +365,7 @@ def _validate_options(descriptor: OrchestrationDescriptor) -> None:
 
 
 def validated_run_request(
-    args: argparse.Namespace, probe: CommandProbe | None = None
+    args: argparse.Namespace, probe: CommandProbe | None = None, *, read_only: bool = False
 ) -> tuple[RunRequest, Config]:
     """The run's request and configuration, validated as a run validates them, with no effect.
 
@@ -408,14 +408,16 @@ def validated_run_request(
             remote_repo=args.repo,
             repo_visibility=args.repo_visibility,
         )
-        validate_run_request(request, git=Git(OsProcesses()))
+        validate_run_request(request, git=Git(OsProcesses()), read_only=read_only)
         return request, config
 
 
 def _run_request(args: argparse.Namespace, runs: Runs | None = None) -> None:
     request = _build_run_request(args)
     result = _execute_run_request(request, production_runs() if runs is None else runs)
-    if result.succeeded:
+    if result.status is RunStatus.PARKED:
+        sys.stdout.write(f"\n{request.orchestration.id} run paused. Resume to continue.\n")
+    elif result.succeeded:
         sys.stdout.write(f"\n{request.orchestration.id} run completed.\n")
         if result.uncompared:
             sys.stdout.write(f"{_UNCOMPARED}\n")

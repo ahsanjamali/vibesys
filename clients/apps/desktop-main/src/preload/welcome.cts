@@ -20,6 +20,7 @@ type Events = typeof import('@vibesys/ipc').WELCOME_EVENTS;
 
 const CHANNELS: Channels = {
   overview: 'vibesys:welcome:overview',
+  runTransportV2: 'vibesys:welcome:run-transport-v2',
   setCheckout: 'vibesys:welcome:set-checkout',
   cancelCheckout: 'vibesys:welcome:cancel-checkout',
   signIn: 'vibesys:welcome:sign-in',
@@ -31,9 +32,9 @@ const CHANNELS: Channels = {
   attach: 'vibesys:welcome:attach',
   attachReader: 'vibesys:welcome:attach-reader',
   resume: 'vibesys:welcome:resume',
-  stopConfirmed: 'vibesys:welcome:stop-confirmed',
   releaseRun: 'vibesys:welcome:release-run',
   readEvents: 'vibesys:welcome:read-events',
+  readTrace: 'vibesys:welcome:read-trace',
   readSummary: 'vibesys:welcome:read-summary',
   readSpan: 'vibesys:welcome:read-span',
   runDigests: 'vibesys:welcome:run-digests',
@@ -68,6 +69,7 @@ const CHANNELS: Channels = {
   openExternal: 'vibesys:welcome:open-external',
 };
 const EVENTS: Events = {
+  hostSettings: 'vibesys:welcome:host-settings-changed',
   recent: 'vibesys:welcome:recent',
   listing: 'vibesys:welcome:listing',
   preferences: 'vibesys:welcome:preferences-changed',
@@ -86,7 +88,7 @@ interface WelcomePreloadCapabilities {
   /** Ask the main process on `channel`; it answers with a `WelcomeResult`. */
   invoke(channel: string, ...args: unknown[]): Promise<unknown>;
   /** Hear every value the main process sends on `channel`. */
-  on(channel: string, listener: (value: unknown) => void): void;
+  on(channel: string, listener: (value: unknown) => void): () => void;
   /**
    * Open one run connection: hand one end of a new channel to the main process and the other to
    * the page, as a window message named `id`.
@@ -104,6 +106,8 @@ function createWelcomePreload(capabilities: WelcomePreloadCapabilities): Welcome
   }
   return {
     platform: capabilities.platform,
+    onHostSettingsChanged: listener => capabilities.on(EVENTS.hostSettings, listener),
+    runTransportV2: (host, enabled) => call(CHANNELS.runTransportV2, host, enabled),
     overview: () => call(CHANNELS.overview),
     setCheckout: (host, path, change) => call(CHANNELS.setCheckout, host, path, change),
     cancelCheckout: change => call(CHANNELS.cancelCheckout, change),
@@ -119,6 +123,8 @@ function createWelcomePreload(capabilities: WelcomePreloadCapabilities): Welcome
     releaseRun: () => call(CHANNELS.releaseRun),
     readEvents: (host, project, runId, fromSequence, max) =>
       call(CHANNELS.readEvents, host, project, runId, fromSequence, max),
+    readTrace: (host, project, runId, fromSequence, max) =>
+      call(CHANNELS.readTrace, host, project, runId, fromSequence, max),
     readSummary: (host, project, runId) => call(CHANNELS.readSummary, host, project, runId),
     readSpan: (host, project, runId, spanId, fromSequence, max) =>
       call(CHANNELS.readSpan, host, project, runId, spanId, fromSequence, max),
@@ -128,7 +134,6 @@ function createWelcomePreload(capabilities: WelcomePreloadCapabilities): Welcome
       call(CHANNELS.usageWindow, host, project, runIds, since, until),
     connectRun: id => capabilities.connectRun(id),
     onWake: listener => capabilities.on(WAKE_CHANNEL, () => listener()),
-    stopConfirmed: (host, instance, force) => call(CHANNELS.stopConfirmed, host, instance, force),
     preferences: () => call(CHANNELS.preferences),
     setAppearance: appearance => call(CHANNELS.setAppearance, appearance),
     setNotifications: enabled => call(CHANNELS.setNotifications, enabled),
@@ -174,8 +179,14 @@ if (process.type === 'renderer') {
     createWelcomePreload({
       platform: process.platform,
       invoke: (channel, ...args) => electron.ipcRenderer.invoke(channel, ...args),
-      on: (channel, listener) =>
-        electron.ipcRenderer.on(channel, (_event, value) => listener(value)),
+      on: (channel, listener) => {
+        const receive = (_event: Electron.IpcRendererEvent, value: unknown): void =>
+          listener(value);
+        electron.ipcRenderer.on(channel, receive);
+        return () => {
+          electron.ipcRenderer.removeListener(channel, receive);
+        };
+      },
       connectRun: id => {
         const {port1: port, port2: remote} = new MessageChannel();
         electron.ipcRenderer.postMessage(CONNECT_CHANNEL, null, [remote]);
@@ -184,6 +195,32 @@ if (process.type === 'renderer') {
       },
     }),
   );
+  electron.contextBridge.exposeInMainWorld('vibesysGateway', {
+    unary: (host, method, bytes) => {
+      let cancel = (): void => {};
+      const result = new Promise<Uint8Array>((resolve, reject) => {
+        let response: Uint8Array | undefined;
+        cancel = openGateway(
+          'unary',
+          host,
+          method,
+          bytes,
+          value => {
+            response = value;
+          },
+          error => {
+            if (error !== undefined) reject(new Error(error));
+            else if (response === undefined) reject(new Error('missing unary response'));
+            else resolve(response);
+          },
+        );
+      });
+      return {result, cancel: () => cancel()};
+    },
+    stream: (host, method, bytes, receive, ended) => ({
+      cancel: openGateway('stream', host, method, bytes, receive, ended),
+    }),
+  } satisfies import('@vibesys/ipc').GatewayBridge);
   prepareFirstPaint(electron.ipcRenderer.sendSync(FIRST_PAINT_CHANNEL));
 }
 
@@ -212,3 +249,31 @@ function prepareFirstPaint(reply: unknown): void {
 }
 
 export = createWelcomePreload;
+
+/** Ports are owned in the preload; renderer callbacks receive only structured protobuf bytes. */
+function openGateway(
+  kind: 'unary' | 'stream',
+  host: string,
+  method: string,
+  bytes: Uint8Array,
+  receive: (bytes: Uint8Array) => void,
+  ended: (error?: string) => void,
+): () => void {
+  const electron: typeof import('electron') = require('electron');
+  const {port1, port2} = new MessageChannel();
+  let closed = false;
+  const finish = (error?: string): void => {
+    if (closed) return;
+    closed = true;
+    port1.postMessage({cancel: true});
+    port1.close();
+    ended(error);
+  };
+  port1.onmessage = event => {
+    const reply = event.data as import('@vibesys/ipc').GatewayReply;
+    if ('bytes' in reply) receive(reply.bytes);
+    else finish(reply.error);
+  };
+  electron.ipcRenderer.postMessage('vibesys:gateway', {kind, host, method, bytes}, [port2]);
+  return () => finish('cancelled');
+}

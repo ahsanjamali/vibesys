@@ -128,8 +128,8 @@ export type Type15 = "command.control";
 export type ControlRequest =
   | SteerRequest
   | PauseRequest
+  | PauseNowRequest
   | ResumeRequest
-  | StopRequest
   | WithdrawRequest
   | CancelAttemptRequest
   | CancelItemRequest
@@ -148,16 +148,14 @@ export type SubjectId = string;
 export type SteerMode = "next_turn" | "standing" | "interrupt";
 export type ControlId1 = string;
 export type Action1 = "pause";
+export type ExpectedEpoch = number | null;
 export type ControlId2 = string;
-export type Action2 = "resume";
+export type Action2 = "pause_now";
+export type ExpectedEpoch1 = number | null;
+export type ControlId3 = string;
+export type Action3 = "resume";
 export type Fallback1 = boolean;
 export type When1 = "now" | "capacity_returns";
-export type ControlId3 = string;
-export type Action3 = "stop";
-/**
- * How a stop treats work in flight: let it finish, or cancel it.
- */
-export type StopMode = "drain" | "cancel";
 export type ControlId4 = string;
 export type Action4 = "withdraw";
 export type Withdraws = string;
@@ -199,7 +197,7 @@ export type ValidationPaths = (string | number)[][] | null;
  * What a control request asks for; the tag of the ``ControlRequest`` union.
  */
 export type ControlAction =
-  "steer" | "pause" | "resume" | "stop" | "withdraw" | "cancel_attempt" | "cancel_item" | "set_max_parallel";
+  "steer" | "pause" | "pause_now" | "resume" | "withdraw" | "cancel_attempt" | "cancel_item" | "set_max_parallel";
 export type Status = "pending" | "consumed";
 export type Question = string;
 export type Answer = string;
@@ -449,6 +447,7 @@ export type Provider4 = string | null;
 export type Model4 = string | null;
 export type ReasoningEffort = string | null;
 export type HarnessVersion = string | null;
+export type Client = ("scripted" | "provider") | null;
 export type Kind7 = "agent_execution_finished";
 export type Error2 = string | null;
 export type Kind8 = string;
@@ -712,6 +711,11 @@ export type Kind47 = "winner_selected";
 export type Selection = "candidate" | "baseline";
 export type Revision3 = string;
 export type SettlementId = string | null;
+/**
+ * Why the optional checkout update advanced or skipped the checkout.
+ */
+export type CheckoutStatus =
+  "fast_forwarded" | "other_branch" | "dirty_tree" | "diverged" | "git_refused" | "operator_changed_checkout";
 export type Kind48 = "input_measurement_failed";
 /**
  * Why the run's input failed its own trusted measurement. Closed.
@@ -1025,10 +1029,7 @@ export type Direction5 = "max" | "min";
 export type Unit6 = string | null;
 export type InputMetrics = MetricRow[];
 export type Metrics = MetricRow[];
-/**
- * Closed measurement kinds used for eligibility requirements.
- */
-export type EvidenceKind = "correctness" | "benchmark" | "profiling";
+export type Check = "correctness" | "benchmark";
 export type Completed = number | null;
 export type Required = number | null;
 export type Unit7 = string | null;
@@ -1042,6 +1043,7 @@ export type Revision4 = string | null;
 export type Outcome = string | null;
 export type Summary5 = string | null;
 export type Probe = boolean;
+export type Sequence2 = number | null;
 
 export interface ProtocolDocument {
   request: Request;
@@ -1088,7 +1090,7 @@ export interface SteerCommand {
   text: Text;
 }
 /**
- * Request stopping after the active agent call.
+ * Internal detached-host shutdown at its cooperative boundary.
  */
 export interface StopCommand {
   protocol_version?: ProtocolVersion3;
@@ -1312,11 +1314,20 @@ export interface SteerTarget {
   id?: SubjectId | null;
 }
 /**
- * Reach the next safe boundary and hold the run there.
+ * Finish turns in flight, release evaluation jobs, save and exit for relaunch.
  */
 export interface PauseRequest {
   control_id: ControlId1;
   action: Action1;
+  expected_epoch?: ExpectedEpoch;
+}
+/**
+ * Cancel unfinished work and exit; saved work remains resumable.
+ */
+export interface PauseNowRequest {
+  control_id: ControlId2;
+  action: Action2;
+  expected_epoch?: ExpectedEpoch1;
 }
 /**
  * Continue a paused run.
@@ -1327,18 +1338,10 @@ export interface PauseRequest {
  * limit, and cannot be combined with ``fallback``, which resumes now.
  */
 export interface ResumeRequest {
-  control_id: ControlId2;
-  action: Action2;
-  fallback?: Fallback1;
-  when?: When1;
-}
-/**
- * End the run, draining or cancelling the work in flight.
- */
-export interface StopRequest {
   control_id: ControlId3;
   action: Action3;
-  mode?: StopMode;
+  fallback?: Fallback1;
+  when?: When1;
 }
 /**
  * End standing guidance: the standing steer sent under ``withdraws``.
@@ -1712,6 +1715,7 @@ export interface AgentExecutionStartedData {
   model?: Model4;
   reasoning_effort?: ReasoningEffort;
   harness_version?: HarnessVersion;
+  client?: Client;
 }
 /**
  * Terminal result for one agent execution.
@@ -1927,6 +1931,7 @@ export interface AgentStatusData {
  */
 export interface SubprocessOutputData {
   kind: Kind22;
+  span_id?: SpanId | null;
   process_id: ProcessId;
   process_kind: ProcessKind;
   stream: Stream1;
@@ -2240,6 +2245,7 @@ export interface ProviderSwitchedData {
  */
 export interface GateStartedData {
   kind: Kind42;
+  span_id?: SpanId | null;
   gate: GateKind;
   recipe?: Recipe;
   command?: Command;
@@ -2258,6 +2264,7 @@ export interface GateStartedData {
  */
 export interface GateFinishedData {
   kind: Kind43;
+  span_id?: SpanId | null;
   gate: GateKind;
   recipe?: Recipe1;
   reused?: Reused;
@@ -2325,6 +2332,7 @@ export interface WinnerSelectedData {
   selection: Selection;
   revision: Revision3;
   settlement_id?: SettlementId;
+  checkout_status?: CheckoutStatus | null;
 }
 /**
  * The run's input failed its trusted measurement, so the run has no trusted baseline.
@@ -2834,7 +2842,7 @@ export interface MetricRow {
  * evaluator reported it got through; each is None when it reported no progress.
  */
 export interface FailedCheck {
-  check: EvidenceKind;
+  check: Check;
   completed?: Completed;
   required?: Required;
   unit?: Unit7;
@@ -2876,6 +2884,7 @@ export interface WorkstreamAttrs {
   outcome?: Outcome;
   summary?: Summary5;
   probe?: Probe;
+  sequence?: Sequence2;
 }
 export interface EvolveSpanAttributes {
   adoption?: AdoptionAttrs | null;

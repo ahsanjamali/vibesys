@@ -25,17 +25,22 @@ import type {WelcomeFeed} from './welcome-feed.js';
 import {
   type WelcomeBinding,
   type WelcomeDocument,
+  type WelcomeInvokeEvent,
   type WelcomeIpc,
   WelcomeRouter,
 } from './welcome-ipc.js';
 import type {AppWindow} from './window.js';
 
 export interface DesktopDeps {
+  readonly gatewaySetting: (
+    host: import('@vibesys/hosts').HostId,
+    enabled: boolean | undefined,
+  ) => Promise<boolean>;
   readonly window: Pick<
     AppWindow,
     'focus' | 'openSettings' | 'releaseSurfaceRun' | 'sendWelcome' | 'welcome'
   >;
-  readonly welcome: Pick<WelcomeFeed, 'recent' | 'snapshot'>;
+  readonly welcome: Pick<WelcomeFeed, 'recent' | 'snapshot' | 'hostSettings'>;
   readonly hosts: Pick<
     Hosts,
     | 'cancelCheckout'
@@ -73,9 +78,9 @@ export interface DesktopDeps {
   >;
   readonly runs: Pick<
     RunControl,
-    'attach' | 'attachReader' | 'attached' | 'detach' | 'resume' | 'start' | 'stop'
+    'attach' | 'attachReader' | 'attached' | 'detach' | 'resume' | 'start'
   >;
-  readonly settings: Pick<SettingsStore, 'onRecentChanged' | 'recentSnapshot'>;
+  readonly settings: Pick<SettingsStore, 'onRecentChanged' | 'recentSnapshot' | 'onHostsChanged'>;
   readonly preferences: Pick<PreferencesMain, 'answer'>;
   readonly newRun: Pick<NewRunMain, 'answer'>;
   /** The app shell's page: the only one admitted to the main window's requests. */
@@ -93,6 +98,7 @@ type ScreenRequest = Extract<
   WelcomeRequest,
   {
     readonly kind:
+      | 'run-transport-v2'
       | 'machines'
       | 'machine'
       | 'inspect-checkout'
@@ -131,8 +137,18 @@ export class Desktop {
   /** Every window's surface requests, routed by the window that sent each. */
   readonly #router: WelcomeRouter;
 
+  /** The same current app documents authorized for welcome requests. */
+  admitsRenderer(event: WelcomeInvokeEvent): boolean {
+    return this.#router.admits(event);
+  }
+
   constructor(deps: DesktopDeps) {
     this.#deps = deps;
+    deps.settings.onHostsChanged(() => {
+      const event = deps.welcome.hostSettings();
+      deps.window.sendWelcome(WELCOME_EVENTS.hostSettings, event);
+      deps.runWindows.sendWelcome(WELCOME_EVENTS.hostSettings, event);
+    });
     deps.settings.onRecentChanged(recent => {
       const generation = ++this.#recentGeneration;
       const value = welcomeRecent(recent);
@@ -278,9 +294,6 @@ export class Desktop {
       case 'resume':
         await runs.resume(request.host, request.project, request.run);
         return null;
-      case 'stop':
-        await runs.stop(request.host, request.instance, request.force, true);
-        return null;
       case 'logs':
         return hosts.logs(request.host, request.instance, request.request, rendererGeneration);
       case 'release-logs':
@@ -289,6 +302,10 @@ export class Desktop {
       case 'read-events': {
         const {host, project, runId, from, max} = request;
         return this.#deps.history.read({host: hostKey(host), project, runId}, from, max);
+      }
+      case 'read-trace': {
+        const {host, project, runId, from, max} = request;
+        return this.#deps.history.read({host: hostKey(host), project, runId}, from, max, 'trace');
       }
       case 'read-summary':
         return hosts.readSummary(request.host, request.project, request.runId);
@@ -331,6 +348,8 @@ export class Desktop {
   #screen(request: ScreenRequest): Promise<unknown> {
     const {machines} = this.#deps;
     switch (request.kind) {
+      case 'run-transport-v2':
+        return this.#deps.gatewaySetting(request.host, request.enabled);
       case 'machines':
         return machines.machines();
       case 'machine':

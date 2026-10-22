@@ -80,6 +80,22 @@ def default_skill_roots() -> tuple[Path, ...]:
     return () if skills is None else (skills,)
 
 
+def checkout_identity(root: Path, git: Git) -> tuple[str, bool]:
+    """Identify the host checkout's committed tree and any local modifications.
+
+    Unlike the host inventory's commit id, the epoch names the tree. Failed
+    probes refuse launch rather than recording invented provenance.
+    """
+    tree = git.run_text(("rev-parse", "HEAD^{tree}"), cwd=root, timeout=2)
+    status = git.run_text(
+        ("status", "--porcelain", "--untracked-files=normal"), cwd=root, timeout=2
+    )
+    if tree.returncode or status.returncode or not tree.stdout.strip():
+        message = "cannot identify the host checkout tree and dirty state"
+        raise RuntimeError(message)
+    return tree.stdout.strip(), bool(status.stdout.strip())
+
+
 def load_objective(bundle: InputBundle) -> str:
     """Return one input bundle's objective text."""
     return bundle.objective
@@ -98,6 +114,7 @@ __all__ = [
     "TaskImageFacts",
     "backend_default_image",
     "build_task_image",
+    "checkout_identity",
     "default_skill_roots",
     "derived_environment_name",
     "editor_image_plan",
@@ -136,7 +153,9 @@ def validate_descriptor(
     registry.resolve(descriptor.id).parse_options(descriptor)
 
 
-def validate_run_request(request: RunRequest, *, registry: OrchestrationRegistry, git: Git) -> None:
+def validate_run_request(
+    request: RunRequest, *, registry: OrchestrationRegistry, git: Git, read_only: bool = False
+) -> None:
     """Reject invalid execution settings and policy role keys before host probes."""
     registration = registry.resolve(request.orchestration.id)
     options = registration.parse_options(request.orchestration)
@@ -153,7 +172,7 @@ def validate_run_request(request: RunRequest, *, registry: OrchestrationRegistry
     require_one_login_per_container(
         specs, containerized=run_environment_uses_docker(request.run_environment)
     )
-    if request.resume is not None and registration.plugin.core is not None:
+    if not read_only and request.resume is not None and registration.plugin.core is not None:
         ensure_resumable(request.project_root, request.resume.run_id)
 
 

@@ -143,6 +143,8 @@ graph TD
     entrypoints --> vs_logs
     entrypoints --> vs_mcp
     entrypoints --> vs_project
+    entrypoints --> vs_proto
+    entrypoints --> vs_runlog
     entrypoints --> vs_runtime
     entrypoints --> vs_sandbox
     entrypoints --> vs_sim
@@ -164,6 +166,7 @@ graph TD
     server --> vs_logs
     server --> vs_project
     server --> vs_prompts
+    server --> vs_proto
     server --> vs_redaction
     server --> vs_sim
     server --> vs_slurm
@@ -178,7 +181,9 @@ graph TD
     vibesys --> vs_mcp
     vibesys --> vs_project
     vibesys --> vs_prompts
+    vibesys --> vs_proto
     vibesys --> vs_redaction
+    vibesys --> vs_runlog
     vibesys --> vs_runtime
     vibesys --> vs_sandbox
     vibesys --> vs_sim
@@ -191,6 +196,7 @@ graph TD
     vs_agent --> vs_sandbox
     vs_agent --> vs_sim
     vs_async_ops --> vs_sim
+    vs_core --> vs_proto
     vs_dst --> vs_core
     vs_dst --> vs_project
     vs_dst --> vs_runtime
@@ -212,7 +218,10 @@ graph TD
     vs_logs --> vs_decode
     vs_logs --> vs_sim
     vs_project --> vs_decode
+    vs_project --> vs_proto
     vs_project --> vs_sim
+    vs_runlog --> vs_proto
+    vs_runlog --> vs_sim
     vs_runtime --> vs_agent
     vs_runtime --> vs_async_ops
     vs_runtime --> vs_core
@@ -224,7 +233,9 @@ graph TD
     vs_runtime --> vs_mcp
     vs_runtime --> vs_project
     vs_runtime --> vs_prompts
+    vs_runtime --> vs_proto
     vs_runtime --> vs_redaction
+    vs_runtime --> vs_runlog
     vs_runtime --> vs_sandbox
     vs_runtime --> vs_sim
     vs_runtime --> vs_slurm

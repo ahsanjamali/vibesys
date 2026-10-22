@@ -86,6 +86,24 @@
     },
     {
       "path": "../../features/run-chat/tsconfig.state.json"
+    },
+    {
+      "path": "../../libs/machine/tsconfig.lib.json"
+    },
+    {
+      "path": "../../libs/run-skeleton/tsconfig.lib.json"
+    },
+    {
+      "path": "../../libs/run-skeleton/tsconfig.reader.json"
+    },
+    {
+      "path": "../../libs/run-skeleton/tsconfig.cache.json"
+    },
+    {
+      "path": "../../features/run-intents/tsconfig.renderer.json"
+    },
+    {
+      "path": "../../features/run-sessions/tsconfig.renderer.json"
     }
   ]
 }

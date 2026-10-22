@@ -8,7 +8,9 @@
  * Resume when capacity returns is followed by `quota_waiting`, and a Pause or a Resume now while it
  * waits by `quota_wait_cancelled`. What the page asked is recorded in order on
  * `window.fakeHost.commands` (a Resume names a `when` other than `now`); `window.fakeHost.send`
- * posts a message to the subscribed stream (see `installFakeLive`).
+ * posts a message to the subscribed stream (see `installFakeLive`). The fake records no history:
+ * an ended run reads that its host serves none, and its helper offers nothing beyond the run's own
+ * server (`helperFeatures`), so Chat is off once it ends.
  * `installFakeServer` runs in the page after `installFakeBridge`, so it is self-contained.
  */
 
@@ -26,37 +28,14 @@ export function installFakeServer(seed: FakeServerSeed): void {
   const commands: string[] = [];
   const encoder = new TextEncoder();
   const ok = (value: unknown) => Promise.resolve({ok: true, value});
-  let sequence = 1;
-  let waiting = false;
   /** Sends to the page's subscribed stream, where the run's events go (not the command channel). */
   let stream: ((message: unknown) => void) | null = null;
-  /** One event the run emits after the seeded batch, as its own batch. */
-  const emitted = (data: {kind: string} & Record<string, unknown>): unknown => {
-    sequence += 1;
-    return {
-      type: 'event_batch',
-      events: [{timestamp: '2026-10-15T16:31:00Z', type: data.kind, sequence, data}],
-      through_sequence: sequence,
-      store_id: 'store-1',
-      history_after_sequence: 0,
-    };
-  };
-  /** What the run emits after acknowledging `type` (with `when`), while paused by `quota`. */
-  const quotaEvents = (type: string, when: string | undefined): unknown[] => {
-    const quota = seed.quota;
-    if (quota === undefined) return [];
-    if (type === 'command.resume' && when === 'capacity_returns') {
-      waiting = true;
-      return [
-        emitted({kind: 'quota_waiting', provider: quota.provider, resumes_at: quota.resumesAt}),
-      ];
-    }
-    if (!waiting) return [];
-    waiting = false;
-    const reason = type === 'command.pause' ? 'paused' : 'resumed';
-    return [emitted({kind: 'quota_wait_cancelled', provider: quota.provider, reason})];
-  };
-  const answer = (request: {type: string; request_id?: string; when?: string}): unknown[] => {
+  const answer = (request: {
+    type: string;
+    request_id?: string;
+    when?: string;
+    control?: {action: string};
+  }): unknown[] => {
     const id = request.request_id ?? 'request';
     const envelope = {protocol_version: 1, request_id: id, timestamp: '2026-10-15T16:30:51Z'};
     switch (request.type) {
@@ -67,6 +46,9 @@ export function installFakeServer(seed: FakeServerSeed): void {
         ];
       case 'query.snapshot':
         return [{...envelope, ok: true, snapshot: seed.snapshot}];
+      case 'command.control':
+        commands.push(`command.control:${request.control?.action}`);
+        return [{...envelope, ok: true, ack: {action: request.control?.action, status: 'pending'}}];
       case 'command.pause':
       case 'command.resume': {
         const {when} = request;
@@ -78,7 +60,6 @@ export function installFakeServer(seed: FakeServerSeed): void {
           ok: true,
           ack: {action: request.type.slice(8), status: 'pending'},
         };
-        for (const event of quotaEvents(request.type, when)) stream?.(event);
         return [ack];
       }
       default:
@@ -117,10 +98,9 @@ export function installFakeServer(seed: FakeServerSeed): void {
       window.postMessage({type: 'vibesys:run-port', id}, '*', [channel.port1]);
     },
     onWake: () => undefined,
-    // This host's helper offers nothing beyond the run's own server: Chat is off once it ends.
     helperFeatures: () => ok([]),
-    // This fake records no history: an ended run reads that its host does not serve one.
     readEvents: () => ok({kind: 'unsupported'}),
+    readTrace: () => ok({kind: 'unsupported'}),
     readSummary: () => ok({kind: 'unsupported'}),
     readSpan: () => ok({kind: 'unsupported'}),
   });

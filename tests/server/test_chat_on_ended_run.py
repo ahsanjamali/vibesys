@@ -38,11 +38,11 @@ from server.events import READER_APPENDABLE_EVENTS, EventType
 from server.host_api import RUN_EVENTS_FILE
 from vibesys.api import (
     AuxiliaryAgentLaunch,
+    PauseNowRequest,
     PauseRequest,
     ResumeRequest,
     RunReady,
     SteerRequest,
-    StopRequest,
 )
 from vibesys.api.request import load_task
 from vibesys.config import Config
@@ -65,10 +65,12 @@ from vs_sim.api.testing import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from tests.server.support import ServerParts
 
     from server.api.protocol import ProtocolRequest
-    from vibesys.api import AuxiliaryAgents, ManagedAgent, RunReader
+    from vibesys.api import AuxiliaryAgents, CoreEvent, ManagedAgent, RunReader
     from vs_agent.api.testing import FakeInvocation
 
 _SEEDS = settings(deadline=None, max_examples=examples(pr=8, nightly=200))
@@ -116,7 +118,10 @@ class _Reader:
     def ready(self) -> RunReady:
         return self._ready
 
-    def open_auxiliary_agents(self) -> AuxiliaryAgents:
+    def open_auxiliary_agents(
+        self, *, sink: Callable[[CoreEvent], object] | None = None
+    ) -> AuxiliaryAgents:
+        del sink
         return self.agents
 
     def close(self) -> None:
@@ -146,6 +151,7 @@ class _EndedRun:
         state = self.root / "state"
         return RunReady(
             record=run_record(self.project, self.run_id),
+            project_root=self.project.root,
             log_directory=self.journal,
             frontend_state_directory=state,
             agent_provider="codex",
@@ -206,7 +212,7 @@ def _commands(text: str, control_id: str) -> list[ProtocolRequest]:
         ),
         ControlCommand(timestamp=REQUEST_TIME, control=PauseRequest(control_id=control_id)),
         ControlCommand(timestamp=REQUEST_TIME, control=ResumeRequest(control_id=control_id)),
-        ControlCommand(timestamp=REQUEST_TIME, control=StopRequest(control_id=control_id)),
+        ControlCommand(timestamp=REQUEST_TIME, control=PauseNowRequest(control_id=control_id)),
     ]
 
 

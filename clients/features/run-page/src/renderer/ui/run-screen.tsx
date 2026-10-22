@@ -22,6 +22,7 @@ import {
 } from '@vibesys/ui';
 import type {JSX, ReactNode} from 'react';
 import {
+  adoptionTitles,
   clockAt,
   clockStart,
   endedView,
@@ -34,8 +35,8 @@ import {
   machineBlockWords,
   NO_MODEL_NAMES,
   type Offer,
+  pauseNowBannerView,
   predatesTraceWords,
-  quotaBannerView,
   type ResolvedZoom,
   type Route,
   RUN_ROUTE,
@@ -52,7 +53,6 @@ import {
   runPhase,
   runWallNow,
   stepLabel,
-  stopBannerView,
   streamLines,
   timelineView,
   traceArrival,
@@ -117,6 +117,7 @@ function reason(offer: Offer): {disabledReason?: string} {
 
 /** The chat panel the app hosts beside the run: whether it is open, the button's press, the panel. */
 export interface RunChatSlot {
+  readonly minimumMain?: 'wide';
   readonly open: boolean;
   readonly toggle: () => void;
   readonly panel: ReactNode;
@@ -170,6 +171,7 @@ function Header(props: {
   readonly names: ModelNames;
   readonly dispatch: Dispatch;
   readonly chat: RunChatSlot | undefined;
+  readonly toolbar?: ReactNode;
 }): JSX.Element {
   const {state, dispatch, chat} = props;
   const header = headerView(state, props.names);
@@ -192,6 +194,7 @@ function Header(props: {
         <RunFacts header={header} />
       </Stack>
       <Row gap="space-2">
+        {props.toolbar}
         {chat === undefined ? null : (
           <Button
             variant={chat.open ? 'primary' : 'secondary'}
@@ -210,34 +213,29 @@ function Header(props: {
             {...reason(header.pause)}
           />
         ) : null}
-        {header.resume.shown ? (
-          <Button
-            variant="primary"
-            text="Resume"
-            press={() => dispatch({type: 'resume'})}
-            {...reason(header.resume)}
-          />
-        ) : null}
-        {header.stop.shown ? (
+        {header.pauseNow.shown ? (
           <Button
             variant="danger"
-            text="Stop"
-            press={() => dispatch({type: 'ask-stop'})}
-            {...reason(header.stop)}
+            text="Pause now"
+            press={() => dispatch({type: 'ask-pause-now'})}
+            {...reason(header.pauseNow)}
           />
         ) : null}
-        <Menu icon="more" label="More actions" variant="quiet" align="end" items={items} />
+        {state.readOnly === true ? null : (
+          <Menu icon="more" label="More actions" variant="quiet" align="end" items={items} />
+        )}
       </Row>
     </Row>
   );
 }
 
-function StopBanner(props: {
+function PauseNowBanner(props: {
   readonly state: RunPageState;
   readonly dispatch: Dispatch;
 }): JSX.Element | null {
   const {state, dispatch} = props;
-  const banner = stopBannerView(state);
+  if (state.readOnly === true) return null;
+  const banner = pauseNowBannerView(state);
   if (banner.kind === 'none') return null;
   if (banner.kind === 'confirm') {
     return (
@@ -249,86 +247,20 @@ function StopBanner(props: {
           <>
             <Button
               variant="danger"
-              text="Stop run"
-              press={() => dispatch({type: 'confirm-stop'})}
+              text="Pause now"
+              press={() => dispatch({type: 'confirm-pause-now'})}
             />
             <Button
               variant="secondary"
               text="Keep running"
-              press={() => dispatch({type: 'cancel-stop'})}
+              press={() => dispatch({type: 'cancel-pause-now'})}
             />
           </>
         }
       />
     );
   }
-  return (
-    <Banner
-      tone="warn"
-      title={banner.title}
-      body={banner.body}
-      {...(banner.forceOffered
-        ? {
-            actions: (
-              <Button
-                variant="danger"
-                text="Force stop"
-                press={() => dispatch({type: 'force-stop'})}
-              />
-            ),
-          }
-        : {})}
-    />
-  );
-}
-
-/** Words an epoch second as the user's local weekday and time; reads no clock. */
-const QUOTA_TIME = new Intl.DateTimeFormat(undefined, {
-  weekday: 'short',
-  hour: '2-digit',
-  minute: '2-digit',
-});
-
-function QuotaBanner(props: {
-  readonly state: RunPageState;
-  readonly dispatch: Dispatch;
-}): JSX.Element | null {
-  const {state, dispatch} = props;
-  const banner = quotaBannerView(state, seconds => QUOTA_TIME.format(seconds * 1000));
-  if (banner === null) return null;
-  return (
-    <Banner
-      tone="warn"
-      title={banner.title}
-      body={banner.body}
-      actions={
-        <>
-          <Button
-            variant="primary"
-            text="Resume now"
-            press={() => dispatch({type: 'resume'})}
-            {...reason(banner.resumeNow)}
-          />
-          {banner.wait.shown ? (
-            <Button
-              variant="secondary"
-              text="Wait and resume when quota is back"
-              press={() => dispatch({type: 'wait-for-quota'})}
-              {...reason(banner.wait)}
-            />
-          ) : null}
-          {banner.stopWaiting.shown ? (
-            <Button
-              variant="secondary"
-              text="Stop waiting"
-              press={() => dispatch({type: 'stop-waiting'})}
-              {...reason(banner.stopWaiting)}
-            />
-          ) : null}
-        </>
-      }
-    />
-  );
+  return null;
 }
 
 function EndedBanner(props: {
@@ -340,6 +272,12 @@ function EndedBanner(props: {
   const ended = endedView(state);
   // The header already says Finished. Logs and Run again remain in the run controls.
   if (ended === null || ended.title === 'Finished') return null;
+  if (state.readOnly === true) {
+    const reason = state.record.kind === 'ended' ? state.record.run.reason : null;
+    return reason ? (
+      <Banner tone={ended.tone} title={state.lifecycleWord ?? ended.title} body={reason} />
+    ) : null;
+  }
   return (
     <Banner
       tone={ended.tone}
@@ -456,10 +394,8 @@ function pendingRunScreen(
   dispatch: Dispatch,
   zoom: Zoom,
   route: Route,
-  chat: RunChatSlot | undefined,
-  names: ModelNames,
+  header: ReactNode,
 ): JSX.Element | null {
-  const header = <Header state={state} names={names} dispatch={dispatch} chat={chat} />;
   if (state.record.kind === 'unlisted') {
     const blocked = machineBlockWords(state);
     const unplaced = unplacedRun(state);
@@ -538,12 +474,41 @@ export function RunScreen(props: {
   readonly chat?: RunChatSlot;
   /** The host's names for the run's models; absent or without a model: its id shows. */
   readonly modelNames?: ModelNames;
+  /** App-owned run diagnostics, in the page’s scrolling body. */
+  readonly toolbar?: ReactNode;
+  readonly supplemental?: ReactNode;
 }): JSX.Element {
   const {chat, ...rest} = props;
   return (
-    <Dock label="Chat" side={chat?.open === true ? chat.panel : null}>
+    <Dock
+      label="Chat"
+      {...(chat?.minimumMain ? {minimumMain: chat.minimumMain} : {})}
+      side={chat?.open === true ? chat.panel : null}
+    >
       <RunScreenBody {...rest} chat={chat} />
     </Dock>
+  );
+}
+
+function RunHeader(
+  props: Parameters<typeof Header>[0] & {readonly scrubber: boolean},
+): JSX.Element {
+  const {scrubber, ...header} = props;
+  const {state, dispatch} = props;
+  return (
+    <Stack gap="space-2">
+      <Header {...header} />
+      {scrubber ? (
+        <RunScrubber
+          log={state.run.trace}
+          view={state.view}
+          ended={runHasEnded(state)}
+          wall={runWallNow(state)}
+          position={state.positionWord}
+          change={view => dispatch({type: 'view', view})}
+        />
+      ) : null}
+    </Stack>
   );
 }
 
@@ -558,18 +523,37 @@ function RunScreenBody(props: {
   readonly dispatch: Dispatch;
   readonly chat: RunChatSlot | undefined;
   readonly modelNames?: ModelNames;
+  /** App-owned run diagnostics, in the page’s scrolling body. */
+  readonly toolbar?: ReactNode;
+  readonly supplemental?: ReactNode;
 }): JSX.Element {
   const {state, model, route, zoom, dispatch} = props;
   const names = props.modelNames ?? NO_MODEL_NAMES;
   const base: ViewBase = {
+    emptyLabelsOnly: state.readOnly === true,
     names,
     model,
-    clock: {start: clockStart(model), now: clockAt(model, runNow(state))},
+    // The run's own start, read from the whole run: a scrubbed model before its first span has no
+    // start to give, and every face measures its times from the same origin at every position.
+    clock: {start: clockStart(props.whole), now: clockAt(model, runNow(state))},
     tokens: props.core?.tokens ?? EMPTY_LEDGER,
     who: whoBySpan(usageRecords(state), names),
+    adoptionTitles: adoptionTitles(model.trace.spans),
     zoom,
   };
-  const pending = pendingRunScreen(state, dispatch, zoom, route, props.chat, names);
+  const pending = pendingRunScreen(
+    state,
+    dispatch,
+    zoom,
+    route,
+    <Header
+      state={state}
+      names={names}
+      dispatch={dispatch}
+      chat={props.chat}
+      toolbar={props.toolbar}
+    />,
+  );
   if (pending !== null) return pending;
   const problem = historyProblem(state);
   const transcript = transcriptLoading(state);
@@ -594,22 +578,17 @@ function RunScreenBody(props: {
     <Screen
       density="compact"
       header={
-        <Stack gap="space-2">
-          <Header state={state} names={names} dispatch={dispatch} chat={props.chat} />
-          {traceArrival(state) === 'arrived' && before === null ? (
-            <RunScrubber
-              log={state.run.trace}
-              view={state.view}
-              ended={runHasEnded(state)}
-              wall={runWallNow(state)}
-              change={view => dispatch({type: 'view', view})}
-            />
-          ) : null}
-        </Stack>
+        <RunHeader
+          state={state}
+          names={names}
+          dispatch={dispatch}
+          chat={props.chat}
+          toolbar={props.toolbar}
+          scrubber={traceArrival(state) === 'arrived' && before === null}
+        />
       }
     >
-      <StopBanner state={state} dispatch={dispatch} />
-      <QuotaBanner state={state} dispatch={dispatch} />
+      <PauseNowBanner state={state} dispatch={dispatch} />
       {state.notice === null ? null : (
         <Banner tone="err" title="The run did not take the command" body={state.notice} />
       )}
@@ -640,6 +619,7 @@ function RunScreenBody(props: {
         <Banner tone="warn" title="The step’s transcript is not available" body={detail.problem} />
       )}
       <LevelBody deep={deep} route={route} zoomed={zoomed} level={level} />
+      {props.supplemental}
     </Screen>
   );
 }

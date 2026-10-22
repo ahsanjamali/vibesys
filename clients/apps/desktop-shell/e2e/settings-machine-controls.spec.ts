@@ -1,5 +1,5 @@
 import {expect, test} from '@playwright/test';
-import {controlsOf, inertness} from './checks/controls-act.js';
+import {checkControls, controlsOf} from './checks/controls-act.js';
 import {settled} from './checks/settle.js';
 import {main, openSettingsAt} from './settings-machine.js';
 import {SETTINGS_PAGES} from './settings-machine-pages.js';
@@ -39,7 +39,14 @@ const INERT_BY_DESIGN: readonly {
 ];
 
 for (const each of SETTINGS_PAGES) {
-  test(`every control of the ${each.name} page acts`, async ({context}) => {
+  test(`every control of the ${each.name} page acts`, async ({
+    context,
+    browser,
+    baseURL,
+    viewport,
+    colorScheme,
+    contextOptions,
+  }) => {
     const first = await context.newPage();
     await openSettingsAt(first, 1440);
     await each.reach(first);
@@ -50,15 +57,15 @@ for (const each of SETTINGS_PAGES) {
     );
     await first.close();
     expect(controls.length, 'the page has controls').toBeGreaterThan(0);
-    const found = await Promise.all(
-      controls.map(async control => {
-        const page = await context.newPage();
+    const found = await checkControls(
+      browser,
+      {...contextOptions, ...(baseURL === undefined ? {} : {baseURL}), viewport, colorScheme},
+      controls,
+      async page => {
         await openSettingsAt(page, 1440);
         await each.reach(page);
-        const problem = await inertness(page, main(page), control);
-        await page.close();
-        return problem;
-      }),
+      },
+      main,
     );
     const inert = found.filter((problem): problem is string => problem !== null);
     expect(inert, `controls that do nothing:\n${inert.join('\n')}`).toEqual([]);

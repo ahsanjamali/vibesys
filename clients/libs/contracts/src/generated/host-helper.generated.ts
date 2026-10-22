@@ -155,6 +155,10 @@ export type RunId1 = string;
 export type FromSequence = number;
 export type Max = number;
 export type WithTotals = boolean | null;
+/**
+ * A closed set of event types ``runs.read_events`` can select (``EVENT_TYPES_BY_KINDS``).
+ */
+export type RunEventKinds = "trace";
 export type RequestId17 = string;
 export type DeadlineMs17 = number;
 export type Type17 = "runs.events_for_span";
@@ -338,6 +342,7 @@ export type HelperFeature =
   | "run_history_pages"
   | "run_span_events"
   | "run_tail"
+  | "run_trace_events"
   | "machine_describe"
   | "checkout_inspect"
   | "preflight"
@@ -689,6 +694,7 @@ export type RoundLabel = string | null;
 export type Role1 = string | null;
 export type Harness = string | null;
 export type Model3 = string | null;
+export type Client = ("scripted" | "provider") | null;
 export type ReasoningEffort1 = string | null;
 export type HarnessVersion = string | null;
 export type StartedAt2 = string | null;
@@ -1348,6 +1354,7 @@ export interface RunsReadEventsRequest {
   from_sequence: FromSequence;
   max: Max;
   with_totals?: WithTotals;
+  kinds?: RunEventKinds | null;
 }
 /**
  * A page of the recorded events of one run-trace span, from its journal on disk.
@@ -1695,8 +1702,8 @@ export interface FailureReason {
 /**
  * How a run ended, as its tombstone reports it: the sidebar's Recent row and the ended banner.
  *
- * ``resumable`` says whether a resume continues the run: its durable record exists and is not
- * terminal. ``resume_from_round`` is the round that resume starts at, when the server knew it
+ * ``resumable`` is retained for older readers; current controls permit every ending.
+ * Launch checks storage and writer exclusion; ``resume_from_round`` is the next round
  * (a crashed server did not say). ``uncompared``: the run adopted a candidate never compared
  * with the input (it failed its own measurement), whichever ``outcome`` ended it.
  */
@@ -2280,6 +2287,7 @@ export interface UsageRecord {
   role: Role1;
   harness: Harness;
   model: Model3;
+  client?: Client;
   reasoning_effort: ReasoningEffort1;
   harness_version: HarnessVersion;
   started_at: StartedAt2;

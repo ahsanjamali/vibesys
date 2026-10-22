@@ -30,7 +30,14 @@ from vs_agent.api import (
     TodoItemData,
     ToolResultPayload,
 )
-from vs_core.api import ComparisonVerdict, EndReason, SpanId, TaskObjective, WireSpan
+from vs_core.api import (
+    CheckoutStatus,
+    ComparisonVerdict,
+    EndReason,
+    SpanId,
+    TaskObjective,
+    WireSpan,
+)
 from vs_redaction.api import redact_diagnostic_text
 from vs_runtime.api.infrastructure import (
     AgentReply,
@@ -46,6 +53,8 @@ JsonResultPayload = _agent_api.JsonResultPayload
 
 class CoreEventType(StrEnum):
     """Closed set of observations produced by a core run."""
+
+    INTENT_STATE = "intent_state"
 
     RUN_STARTED = "run_started"
     RUN_STARTUP_PROGRESS = "run_startup_progress"
@@ -119,6 +128,8 @@ class CoreEventType(StrEnum):
     GUIDANCE_ENDED = "guidance_ended"
     GUIDANCE_REACHED = "guidance_reached"
     PAUSE_REQUESTED = "pause_requested"
+    PARK_REQUESTED = "park_requested"
+    PARKED = "parked"
     RESUMED = "resumed"
     STOP_REQUESTED = "stop_requested"
     STEER_CONSUMED = "steer_consumed"
@@ -200,6 +211,13 @@ class SteerDeliveryData(EventPayload):
     delivery: SteerDelivery
 
 
+class IntentStateData(EventPayload):
+    """A generated IntentState's JSON inside the transitional journal envelope."""
+
+    kind: Literal["intent_state"] = "intent_state"
+    state_json: str
+
+
 class InvocationStartedData(EventPayload):
     """Prompts submitted at the start of a model invocation."""
 
@@ -243,6 +261,8 @@ class AgentExecutionStartedData(EventPayload):
     """The reasoning effort the session was configured with; ``None`` when the provider's default."""
     harness_version: str | None = None
     """The provider CLI's version when a driver reported it; ``None`` when unknown."""
+    client: Literal["scripted", "provider"] | None = None
+    """Who executed the turn. The provider and model stay the role's selection."""
 
 
 class AgentExecutionFinishedData(EventPayload):
@@ -679,6 +699,8 @@ class SubprocessOutputData(EventPayload):
     """Captured output from a managed subprocess."""
 
     kind: Literal["subprocess_output"] = "subprocess_output"
+    span_id: SpanId | None = Field(default=None, exclude_if=lambda value: value is None)
+    """The operation that owns this stage, when its submission named one."""
     process_id: str
     process_kind: str
     stream: OutputStream
@@ -757,6 +779,8 @@ class GateStartedData(EventPayload):
     """
 
     kind: Literal["gate_started"] = "gate_started"
+    span_id: SpanId | None = Field(default=None, exclude_if=lambda value: value is None)
+    """The operation that owns this stage, when its submission named one."""
     gate: GateKind
     # The validation recipe being executed; None for build, accuracy and benchmark.
     recipe: str | None = None
@@ -778,6 +802,8 @@ class GateFinishedData(EventPayload):
     """
 
     kind: Literal["gate_finished"] = "gate_finished"
+    span_id: SpanId | None = Field(default=None, exclude_if=lambda value: value is None)
+    """The operation that owns this stage, when its submission named one."""
     gate: GateKind
     recipe: str | None = None
     # True when a prior result for the same input was reused instead of
@@ -869,6 +895,8 @@ class WinnerSelectedData(EventPayload):
     selection: Literal["candidate", "baseline"]
     revision: str
     settlement_id: str | None = None
+    checkout_status: CheckoutStatus | None = None
+    """The checkout publication status, when this selection recorded one."""
 
 
 class InputMeasurementFailureKind(StrEnum):
@@ -978,8 +1006,8 @@ class ComparisonsReadData(EventPayload):
 class WorkstreamFailureKind(StrEnum):
     """Why a workstream ended without a measured candidate. Closed.
 
-    Mirrors ``dynamic.search.api.FailureKind`` member-for-member: a frozen
-    wire vocabulary core's own enum can't silently rename underneath.
+    Frozen operator vocabulary. Policies translate their richer failure kinds
+    before publishing a round, retaining the specific reason in its text.
     """
 
     STOPPED = "stopped"
@@ -1094,7 +1122,8 @@ class SpanEndedData(_SpanData):
 
 
 CoreEventData = Annotated[
-    SteerDeliveryData
+    IntentStateData
+    | SteerDeliveryData
     | InvocationStartedData
     | InvocationFinishedData
     | AgentExecutionStartedData

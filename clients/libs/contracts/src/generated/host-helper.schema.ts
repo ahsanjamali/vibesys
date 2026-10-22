@@ -1667,7 +1667,7 @@ const hostHelperSchema: Record<string, unknown> = {
     },
     "EndRecord": {
       "additionalProperties": false,
-      "description": "How a run ended, as its tombstone reports it: the sidebar's Recent row and the ended banner.\n\n``resumable`` says whether a resume continues the run: its durable record exists and is not\nterminal. ``resume_from_round`` is the round that resume starts at, when the server knew it\n(a crashed server did not say). ``uncompared``: the run adopted a candidate never compared\nwith the input (it failed its own measurement), whichever ``outcome`` ended it.",
+      "description": "How a run ended, as its tombstone reports it: the sidebar's Recent row and the ended banner.\n\n``resumable`` is retained for older readers; current controls permit every ending.\nLaunch checks storage and writer exclusion; ``resume_from_round`` is the next round\n(a crashed server did not say). ``uncompared``: the run adopted a candidate never compared\nwith the input (it failed its own measurement), whichever ``outcome`` ended it.",
       "properties": {
         "outcome": {
           "$ref": "#/$defs/RunEndOutcome"
@@ -2704,6 +2704,7 @@ const hostHelperSchema: Record<string, unknown> = {
         "run_history_pages",
         "run_span_events",
         "run_tail",
+        "run_trace_events",
         "machine_describe",
         "checkout_inspect",
         "preflight",
@@ -5448,6 +5449,14 @@ const hostHelperSchema: Record<string, unknown> = {
       "title": "RunEndingFact",
       "type": "object"
     },
+    "RunEventKinds": {
+      "description": "A closed set of event types ``runs.read_events`` can select (``EVENT_TYPES_BY_KINDS``).",
+      "enum": [
+        "trace"
+      ],
+      "title": "RunEventKinds",
+      "type": "string"
+    },
     "RunList": {
       "additionalProperties": false,
       "description": "A project's runs, oldest first.",
@@ -6732,6 +6741,17 @@ const hostHelperSchema: Record<string, unknown> = {
           ],
           "default": null,
           "title": "With Totals"
+        },
+        "kinds": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunEventKinds"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -8039,6 +8059,22 @@ const hostHelperSchema: Record<string, unknown> = {
           ],
           "title": "Model"
         },
+        "client": {
+          "anyOf": [
+            {
+              "enum": [
+                "scripted",
+                "provider"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Client"
+        },
         "reasoning_effort": {
           "anyOf": [
             {
@@ -8750,7 +8786,8 @@ const hostHelperSchema: Record<string, unknown> = {
       "span_id": "logs_by_span"
     },
     "runs.read_events": {
-      "with_totals": "run_history_pages"
+      "with_totals": "run_history_pages",
+      "kinds": "run_trace_events"
     },
     "runs.summary": {
       "offset": "run_summary",
@@ -8766,6 +8803,15 @@ const hostHelperSchema: Record<string, unknown> = {
     "run.reader": {
       "with_chat": "chat_ended_run_questions"
     }
+  },
+  "x-vibesys-event-types-by-kinds": {
+    "trace": [
+      "span_started",
+      "span_updated",
+      "span_ended",
+      "run_started",
+      "gate_finished"
+    ]
   }
 };
 

@@ -9,17 +9,13 @@ import {
 } from './fake-bridge.js';
 import {type FakeRunSeed, installFakeRun} from './fake-run.js';
 import {type FakeServerSeed, installFakeServer} from './fake-server.js';
+import {addInitScripts, initScript} from './init-scripts.js';
 import {STARTED_AT} from './started-at.js';
 
-/**
- * The Run screen's journey against the Fake bridge and a fake run that reports its startup steps
- * and writes its logs: open it from the sidebar, watch it start, read its logs, stop it (with Force
- * stop offered only once stopping has taken two minutes on the page's clock), and see it end.
- * Screens are checked in the Ink theme; `RUN_PAGE_SHOTS` names a directory to save them in.
- */
+/** The Run screen starts, drains, cancels, and resumes through its shipping bridge. */
 
 interface FakeHostWindow extends Window {
-  fakeHost: {listing(listing: unknown): void; calls: unknown[][]};
+  fakeHost: {commands: string[]; listing(listing: unknown): void; calls: unknown[][]};
 }
 
 const PROJECT = '/home/me/vibesys-projects/queue-rs';
@@ -109,12 +105,14 @@ const RUN: FakeRunSeed = {
 };
 
 async function open(page: Page, seed: FakeBridgeSeed): Promise<void> {
-  await page.addInitScript(installFakeBridge, seed);
-  await page.addInitScript(installFakeMachines, seed);
-  await page.addInitScript(installFakeNewRun, seed);
-  await page.addInitScript(installFakeProjectRuns, seed);
-  await page.addInitScript(installFakeRun, RUN);
-  await page.addInitScript(installFakeServer, SERVER);
+  await addInitScripts(page, [
+    initScript(installFakeBridge, seed),
+    initScript(installFakeMachines, seed),
+    initScript(installFakeNewRun, seed),
+    initScript(installFakeProjectRuns, seed),
+    initScript(installFakeRun, RUN),
+    initScript(installFakeServer, SERVER),
+  ]);
   await page.goto('./shell.html');
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'ink');
   await page
@@ -142,7 +140,7 @@ async function calls(page: Page): Promise<unknown[][]> {
 
 test.use({colorScheme: 'dark'});
 
-test('a run starts, writes its logs, stops with Force stop after the bound, and ends', async ({
+test('a run starts, writes its logs, permits cancellation during drain, and resumes after ending', async ({
   page,
 }) => {
   await page.clock.install();
@@ -161,7 +159,7 @@ test('a run starts, writes its logs, stops with Force stop after the bound, and 
   // Running: the timeline goes; the Logs face groups the streams by owner and follows one.
   await push(page, listed([server('running')], []));
   await expect(startup).toHaveCount(0);
-  await expect(page.getByRole('button', {name: 'Pause'})).toBeEnabled();
+  await expect(page.getByRole('button', {name: 'Pause', exact: true})).toBeEnabled();
   await page.getByRole('radiogroup', {name: 'Show'}).getByText('Logs').click();
   const streams = page.getByRole('listbox', {name: 'Log streams'});
   for (const group of ['Startup', 'Gates', 'Tool builds', 'Run narration']) {
@@ -178,27 +176,18 @@ test('a run starts, writes its logs, stops with Force stop after the bound, and 
   expect((await new AxeBuilder({page}).analyze()).violations).toEqual([]);
   await shot(page, 'ink-logs');
 
-  // Stop: the confirmation says what is lost; Force stop only after two minutes of stopping.
-  await page.getByRole('button', {name: 'Stop', exact: true}).click();
-  await expect(page.getByText('cannot be resumed')).toBeVisible();
-  await shot(page, 'ink-stop-confirm');
-  await page.getByRole('button', {name: 'Stop run'}).click();
-  await expect.poll(() => calls(page)).toEqual([['stopConfirmed', 'ssh:host-b', INSTANCE, false]]);
+  // Pause now is immediately available while a graceful Pause drains.
   await push(page, listed([server('stopping')], []));
-  const force = page.getByRole('button', {name: 'Force stop'});
-  await page.clock.fastForward('01:59');
-  await expect(page.getByText('Stopping · waiting')).toBeVisible();
-  await expect(force).toHaveCount(0);
-  await page.clock.fastForward('00:02');
-  await expect(force).toBeVisible();
-  await shot(page, 'ink-force-stop');
-  await force.click();
+  await expect(page.getByText('Pausing', {exact: true}).first()).toBeVisible();
+  await page.getByRole('button', {name: 'Pause now', exact: true}).click();
+  await expect(
+    page.getByText('Unfinished work may need repeating and may still incur charges.'),
+  ).toBeVisible();
+  await shot(page, 'ink-pause-now-confirm');
+  await page.getByRole('button', {name: 'Pause now', exact: true}).last().click();
   await expect
-    .poll(() => calls(page))
-    .toEqual([
-      ['stopConfirmed', 'ssh:host-b', INSTANCE, false],
-      ['stopConfirmed', 'ssh:host-b', INSTANCE, true],
-    ]);
+    .poll(() => page.evaluate(() => (window as unknown as FakeHostWindow).fakeHost.commands))
+    .toContain('command.control:pause_now');
 
   // Ended: the banner reads the end record; Resume names the round, only when resumable.
   await push(
@@ -216,10 +205,9 @@ test('a run starts, writes its logs, stops with Force stop after the bound, and 
     ),
   );
   await expect(page.getByText('W6’s benchmark timed out after 300 s.')).toBeVisible();
-  await expect(force).toHaveCount(0);
   expect((await new AxeBuilder({page}).analyze()).violations).toEqual([]);
   await shot(page, 'ink-ended');
-  await page.getByRole('button', {name: 'Resume from round 2'}).click();
+  await page.getByRole('button', {name: 'Resume', exact: true}).click();
   await expect
     .poll(async () => (await calls(page)).at(-1))
     .toEqual(['resume', 'ssh:host-b', PROJECT, RUN_ID]);
@@ -245,7 +233,7 @@ test('the run level says what will appear before anything is measured, and keeps
   await expect(page.getByText('No ideas yet')).toBeVisible();
 });
 
-test('a cleanly stopped run offers no Resume', async ({page}) => {
+test('every ended run offers Resume', async ({page}) => {
   const stopped = server('stopped', {
     outcome: 'stopped',
     reason: 'Stopped by you.',
@@ -253,7 +241,7 @@ test('a cleanly stopped run offers no Resume', async ({page}) => {
   });
   await open(page, {...SEED, listings: [listed([], [stopped])]});
   await expect(page.getByText('Stopped by you.')).toBeVisible();
-  await expect(page.getByRole('button', {name: /^Resume/})).toHaveCount(0);
+  await expect(page.getByRole('button', {name: 'Resume', exact: true})).toBeVisible();
   await page.getByRole('button', {name: 'View logs'}).click();
   await expect(
     page.getByRole('radiogroup', {name: 'Show'}).getByRole('radio', {name: 'Logs'}),

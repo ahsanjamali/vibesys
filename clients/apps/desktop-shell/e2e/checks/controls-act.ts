@@ -8,7 +8,7 @@
  * while the panes stay as they were is dead. The comparison reads the accessibility tree once the
  * screen has settled (`settle.ts`), so it never waits for a duration.
  */
-import type {Locator, Page} from '@playwright/test';
+import type {Browser, BrowserContextOptions, Locator, Page} from '@playwright/test';
 import {settled} from './settle.js';
 
 /** The roles the check uses, and how it uses each. */
@@ -64,7 +64,18 @@ export async function controlsOf(scope: Locator): Promise<Control[]> {
 /** What a person reads off the page: its accessibility tree without the controls' own state. */
 async function content(page: Page): Promise<string> {
   const tree = await page.locator('body').ariaSnapshot();
-  return tree.replace(/ \[(?:active|checked|selected|pressed|current)(?:=[^\]]*)?\]/g, '');
+  // Chromium omits optgroup children from its Linux snapshot. Read the displayed text too,
+  // as ariaSnapshot already does for text fields, rather than counting selection flags.
+  const selections = await page
+    .getByRole('combobox')
+    .evaluateAll(elements =>
+      elements.map(element =>
+        element instanceof HTMLSelectElement
+          ? [...element.selectedOptions].map(option => option.textContent)
+          : null,
+      ),
+    );
+  return `${tree.replace(/ \[(?:active|checked|selected|pressed|current)(?:=[^\]]*)?\]/g, '')}\n${JSON.stringify(selections)}`;
 }
 
 /** Uses `control` as a person would: presses it, types in it, picks another option, or moves it. */
@@ -90,11 +101,7 @@ async function use(scope: Locator, control: Control): Promise<void> {
 }
 
 /** `null` when using `control` changes the screen; else the sentence saying it does nothing. */
-export async function inertness(
-  page: Page,
-  scope: Locator,
-  control: Control,
-): Promise<string | null> {
+async function inertness(page: Page, scope: Locator, control: Control): Promise<string | null> {
   await settled(page);
   const before = await content(page);
   await use(scope, control);
@@ -102,4 +109,34 @@ export async function inertness(
   return (await content(page)) === before
     ? `${describeControl(control)} changes nothing on the screen`
     : null;
+}
+
+/** Each control owns a fresh browser context, including its storage and any popups. */
+export async function checkControls(
+  browser: Browser,
+  options: BrowserContextOptions,
+  controls: readonly Control[],
+  reach: (page: Page) => Promise<void>,
+  scope: (page: Page) => Locator,
+): Promise<(string | null)[]> {
+  const found: (string | null)[] = [];
+  const pending = controls.entries();
+  const outcomes = await Promise.allSettled(
+    Array.from({length: Math.min(2, controls.length)}, async () => {
+      for (const [index, control] of pending) {
+        const context = await browser.newContext(options);
+        try {
+          const page = await context.newPage();
+          await reach(page);
+          found[index] = await inertness(page, scope(page), control);
+        } finally {
+          await context.close();
+        }
+      }
+    }),
+  );
+  for (const outcome of outcomes) {
+    if (outcome.status === 'rejected') throw outcome.reason;
+  }
+  return found;
 }

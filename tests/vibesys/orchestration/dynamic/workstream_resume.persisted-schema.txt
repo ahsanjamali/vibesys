@@ -168,7 +168,7 @@ InvocationId {"additionalProperties":false,"type":"object"}
 InvocationId.kind optional {"const":"invocation","default":"invocation","type":"string"}
 InvocationId.root required {"minLength":1,"pattern":"^\\S+$","type":"string"}
 InvocationRef {"additionalProperties":false,"type":"object"}
-InvocationRef.generation required {"$ref":"#/$defs/Generation"}
+InvocationRef.generation required {"minimum":0,"type":"integer"}
 InvocationRef.invocation_id required {"$ref":"#/$defs/InvocationId"}
 InvocationRef.session_id required {"$ref":"#/$defs/SessionId"}
 Measured {"additionalProperties":false,"type":"object"}
@@ -242,11 +242,11 @@ Positive {"exclusiveMinimum":0,"maximum":1000,"type":"integer"}
 Proof {"additionalProperties":false,"type":"object"}
 Proof.refs required {"items":{"$ref":"#/$defs/EvidenceRef"},"type":"array"}
 Reading {"additionalProperties":false,"type":"object"}
-Reading.direction optional {"anyOf":[{"$ref":"#/$defs/Direction"},{"type":"null"}],"default":null}
+Reading.direction optional {"anyOf":[{"enum":["max","min"],"type":"string"},{"type":"null"}],"default":null}
 Reading.metric required {"minLength":1,"type":"string"}
 Reading.repetitions optional {"default":1,"minimum":1,"type":"integer"}
 Reading.unit optional {"anyOf":[{"type":"string"},{"type":"null"}],"default":null}
-Reading.value required {"$ref":"#/$defs/Finite"}
+Reading.value required {"type":"number"}
 RejectionCode {"enum":["stale-view","identity-conflict","unknown-kind","unknown-schema","undeclared-operation","capability","ownership","generation","closed-scope","budget","dependency","evidence","already-settled","not-implemented-in-kernel"],"type":"string"}
 RequestId {"additionalProperties":false,"type":"object"}
 RequestId.kind optional {"const":"request","default":"request","type":"string"}
@@ -289,8 +289,9 @@ SchemaRef {"additionalProperties":false,"type":"object"}
 SchemaRef.name required {"minLength":1,"type":"string"}
 SchemaRef.version required {"minimum":1,"type":"integer"}
 Scope {"additionalProperties":false,"type":"object"}
-Scope.generation required {"$ref":"#/$defs/Generation"}
-Scope.owner required {"discriminator":{"mapping":{"attempt":"#/$defs/AttemptId","run":"#/$defs/RunId"},"propertyName":"kind"},"oneOf":[{"$ref":"#/$defs/RunId"},{"$ref":"#/$defs/AttemptId"}]}
+Scope.generation required {"minimum":0,"type":"integer"}
+Scope.owner required {"$ref":"#/$defs/ScopeOwner"}
+ScopeOwner {"discriminator":{"mapping":{"attempt":"#/$defs/AttemptId","run":"#/$defs/RunId"},"propertyName":"kind"},"oneOf":[{"$ref":"#/$defs/RunId"},{"$ref":"#/$defs/AttemptId"}]}
 Seconds {"minimum":0,"type":"number"}
 SessionId {"additionalProperties":false,"type":"object"}
 SessionId.kind optional {"const":"session","default":"session","type":"string"}
@@ -309,7 +310,7 @@ StepId {"pattern":"^[a-z0-9][a-z0-9_-]{0,39}$","type":"string"}
 StrayUnapplied {"additionalProperties":false,"type":"object"}
 StrayUnapplied.hypothesis_id required {"type":"string"}
 StrayUnapplied.index required {"minimum":0,"type":"integer"}
-TurnFailureKind {"enum":["provider_failed","transport_lost","cancelled","provider_unavailable"],"type":"string"}
+TurnFailureKind {"enum":["provider_failed","transport_lost","cancelled","epoch_interrupted","provider_unavailable"],"type":"string"}
 UnappliedPart {"additionalProperties":false,"type":"object"}
 UnappliedPart.hypothesis_id required {"minLength":1,"type":"string"}
 UnappliedPart.part required {"minLength":1,"type":"string"}

@@ -1,6 +1,6 @@
 import {expect, type Page, test} from '@playwright/test';
 import {fixtureNamed} from '@vibesys/run-fixtures';
-import {controlsOf, inertness} from './checks/controls-act.js';
+import {checkControls, controlsOf} from './checks/controls-act.js';
 import {settled} from './checks/settle.js';
 import {openFixture, playLive} from './fixture-world.js';
 
@@ -80,7 +80,14 @@ const fixtureFor = (start: string): string =>
 
 for (const start of CELLS) {
   const fixtureName = fixtureFor(start);
-  test(`every control of ${start} acts on ${fixtureName}`, async ({context}) => {
+  test(`every control of ${start} acts on ${fixtureName}`, async ({
+    context,
+    browser,
+    baseURL,
+    viewport,
+    colorScheme,
+    contextOptions,
+  }) => {
     const first = await context.newPage();
     await reachScreen(first, fixtureName, start);
     const exempt = INERT_BY_DESIGN.filter(each => each.start.test(start));
@@ -89,14 +96,14 @@ for (const start of CELLS) {
     );
     await first.close();
     expect(controls.length, 'the screen has controls').toBeGreaterThan(0);
-    const found = await Promise.all(
-      controls.map(async control => {
-        const page = await context.newPage();
+    const found = await checkControls(
+      browser,
+      {...contextOptions, ...(baseURL === undefined ? {} : {baseURL}), viewport, colorScheme},
+      controls,
+      async page => {
         await reachScreen(page, fixtureName, start);
-        const problem = await inertness(page, page.getByRole('main'), control);
-        await page.close();
-        return problem;
-      }),
+      },
+      page => page.getByRole('main'),
     );
     const inert = found.filter((problem): problem is string => problem !== null);
     expect(inert, `controls that do nothing:\n${inert.join('\n')}`).toEqual([]);

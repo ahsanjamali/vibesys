@@ -1707,7 +1707,7 @@ def test_collection_resume_requires_project_metadata(tmp_path: Path) -> None:
     assert "not a VibeSys project" in exc.value.diagnostic.message
 
 
-def test_resume_switches_to_the_recorded_run_branch(
+def test_resume_reads_the_recorded_run_without_switching_the_project_branch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1753,10 +1753,11 @@ def test_resume_switches_to_the_recorded_run_branch(
     )
     _git(project, "switch", "-q", "main")
     monkeypatch.chdir(project)
+    original = (task_path(project) / "OBJECTIVE.md").read_text()
 
     invocation = parse_cli_invocation(["--resume", run_id])
 
-    assert invocation.args.input_bundle.objective == "Objective on the run branch.\n"
+    assert invocation.args.input_bundle.objective == original
     branch = run_test_command(
         ["git", "branch", "--show-current"],
         cwd=project,
@@ -1764,7 +1765,8 @@ def test_resume_switches_to_the_recorded_run_branch(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    assert branch == f"vibesys-runs/{run_id}"
+    assert branch == "main"
+    assert (task_path(project) / "OBJECTIVE.md").read_text() == original
 
 
 def test_agent_resume_restores_its_configuration(
@@ -2314,7 +2316,6 @@ def test_dispatch_owns_headless_rendering(
     cli.dispatch(["--input", str(project)])
 
     assert [call.args[0].type for call in renderer.handle.call_args_list] == [
-        CoreEventType.RUN_STARTED,
         CoreEventType.RUN_FINISHED,
     ]
 
@@ -2337,7 +2338,6 @@ def test_dispatch_records_failure_through_the_headless_renderer(
         cli.dispatch(["--input", str(project)])
 
     assert [call.args[0].type for call in renderer.handle.call_args_list] == [
-        CoreEventType.RUN_STARTED,
         CoreEventType.RUN_FAILED,
     ]
 
@@ -2494,3 +2494,41 @@ def test_resume_of_a_host_run_leaves_the_environment_to_be_derived_from_its_back
     # Docker here is the pre-derivation default; the runtime turns it into the
     # host environment for a host-only backend on macOS and rejects it elsewhere.
     assert run_environment_spec_from_args(args).name == "docker"
+
+
+@pytest.mark.parametrize("environment", ["docker", "slurm"])
+@pytest.mark.parametrize("present", [False, True])
+def test_chat_reader_resolves_saved_task_image_without_building(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    environment: Literal["docker", "slurm"],
+    *,
+    present: bool,
+) -> None:
+    _, daemon, image = _resume_task_image(
+        tmp_path,
+        monkeypatch,
+        environment=environment,
+        recorded=_current_reference,
+        daemon=lambda image: _FakeDockerDaemon(
+            {image: _OLD_ID} if present else {}, next_id=_NEW_ID
+        ),
+    )
+
+    def reader() -> RunEnvironmentSpec:
+        args = parse_cli_invocation(["--resume", "20260811-120000-11111111-agent"]).args
+        return run_environment_spec_from_args(
+            args,
+            task_image=TaskImageBuild(
+                backend=ComputeBackend.CUDA, runner=daemon, allow_build=False
+            ),
+        )
+
+    if present:
+        spec = reader()
+        assert spec.image_id == _OLD_ID
+        assert spec.options["image"] == image
+    else:
+        with pytest.raises(ValueError, match="chat reader cannot rebuild"):
+            reader()
+    assert daemon.builds == []

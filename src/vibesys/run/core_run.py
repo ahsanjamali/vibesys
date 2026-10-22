@@ -22,8 +22,6 @@ from vs_core.api import (
     EndReason,
     RetainedCandidate,
     RunResultProposal,
-    StopMode,
-    reopens_on_resume,
 )
 from vs_core.api import RunStatus as CoreRunStatus
 from vs_project.api import Project
@@ -37,7 +35,6 @@ from vs_runtime.api.core import (
     RunControlBridge,
     RunLoopConfig,
     drive_core,
-    reject_ended_resume,
     reject_legacy_resume,
     start_core_awaiting_lease,
 )
@@ -79,7 +76,7 @@ class CoreRunRefusedError(RuntimeError):
         )
 
 
-class _SteerTexts:
+class StoredSteerArtifacts:
     """Where steer text lives: the run's content-addressed artifact store.
 
     A steer control carries only the digest of its text, so the text must be readable by
@@ -87,6 +84,7 @@ class _SteerTexts:
     """
 
     def __init__(self, artifacts: ArtifactStore) -> None:
+        """Store steer text in the run's content-addressed artifacts."""
         self._artifacts = artifacts
 
     def put(self, ref: ArtifactRef, text: str) -> None:
@@ -107,16 +105,10 @@ def _loop_config(run_id: str, timing: RunTiming) -> RunLoopConfig:
 
 
 def ensure_resumable(project_root: Path, run_id: str) -> None:
-    """Reject resuming a run that cannot go on, before any resource opens.
+    """Validate today's loader prerequisites without restricting previous epoch endings.
 
-    Two runs cannot: one a legacy loop created (the core cannot continue its state, and
-    starting a fresh run under its identity would discard that run's history), and one whose
-    core record is terminal for a reason of its own (core never applies another request to it,
-    so booting it only to find it ended would cost the container and environment and say
-    nothing). A run the operator's stop ended is not one: the resume reopens it. Every entrypoint
-    resolves its resume reference through here, so the CLI, headless and the server all
-    refuse with the same diagnostic: the run, and the legacy file or the stored outcome and
-    reason.
+    Retained older formats need the later facts importer. Leave their files in place and
+    identify the missing prerequisite before opening execution resources.
     """
     project = Project.open(project_root)
     try:
@@ -128,19 +120,10 @@ def ensure_resumable(project_root: Path, run_id: str) -> None:
                 code=diagnostic.code,
                 stage=diagnostic.stage,
                 message=(
-                    f"cannot resume run {run_id!r}: it was created by a legacy loop "
+                    f"run {run_id!r} needs the retained-facts importer for its legacy state "
                     f"({diagnostic.path}, schema {diagnostic.source_schema}); "
-                    "start a new run instead"
+                    "the current core loader cannot read this format; retained files are unchanged"
                 ),
-            )
-        ) from error
-    try:
-        reject_ended_resume(project, run_id)
-    except CoreResumeError as error:
-        diagnostic = error.diagnostic
-        raise ConfigurationError(
-            ConfigurationDiagnostic(
-                code=diagnostic.code, stage=diagnostic.stage, message=diagnostic.message
             )
         ) from error
 
@@ -167,10 +150,14 @@ async def drive_core_run(host: CoreHost, integration: LocalRunIntegration) -> Ru
     delivery = JournalPublicationDelivery(services.publications, services.bindings.registry)
     controls = RunControlBridge(
         integration.control,
-        _SteerTexts(services.artifacts),
+        StoredSteerArtifacts(services.artifacts),
         inbox=None
         if services.control_inbox is None
-        else OperatorInbox(services.control_inbox, integration.run_control),
+        else OperatorInbox(
+            services.control_inbox,
+            integration.run_control,
+            integration.events,
+        ),
         control=integration.run_control,
         # A process that opens an existing run is the operator's explicit resume of it.
         lifts_standing_stop=True,
@@ -178,10 +165,6 @@ async def drive_core_run(host: CoreHost, integration: LocalRunIntegration) -> Ru
     loop = CoreRunHost(shell, delivery, services.clock, controls, workspaces=host.workspaces)
     config = _loop_config(services.run_id, host.timing)
     await start_core_awaiting_lease(loop, config)
-    if services.stop_requested:
-        # A force stop killed the server before the run committed its stop; the run
-        # commits it now, before asking its search for anything, and only drains.
-        integration.control.request_stop(StopMode.DRAIN)
     bridge = services.agent_evaluation
     run_error: BaseException | None = None
     try:
@@ -220,16 +203,23 @@ async def drive_core_run(host: CoreHost, integration: LocalRunIntegration) -> Ru
                 # A crashed process cannot reach this line, so its restart waits out the
                 # lease (see ``start_core_awaiting_lease``); any return or raise here frees it.
                 shell.release_lease(now_at=services.clock.now())
-                integration.events.emit(CoreEventType.RUN_ENDING, data=run_ending(shell))
+                _record_ending(shell, integration)
     if outcome.refusal is not None:
         raise CoreRunRefusedError(services.run_id, outcome.refusal)
     return _run_end(outcome.result, shell, integration.environment_failure.reason)
+
+
+def _record_ending(shell: CoreRuntime, integration: LocalRunIntegration) -> None:
+    if shell.record.envelope.core.run.status != CoreRunStatus.PARKED:
+        integration.events.emit(CoreEventType.RUN_ENDING, data=run_ending(shell))
 
 
 def _run_end(
     result: RunResultProposal | None, shell: CoreRuntime, environment_failure: str | None
 ) -> RunEnd:
     """How the run ended: the environment's failure, when it stopped the run, else its result."""
+    if shell.record.envelope.core.run.status == CoreRunStatus.PARKED:
+        raise OperatorPaused
     uncompared = result is not None and result.uncompared
     if environment_failure is not None:
         # The environment's failure stopped the run; it ended as a failure, not a stop.
@@ -256,7 +246,7 @@ def run_ending(shell: CoreRuntime) -> RunEndingData:
     return RunEndingData(
         reason=reason,
         summary="" if result is None else result.reason,
-        resumable=core.run.status != CoreRunStatus.TERMINAL or reopens_on_resume(core.run),
+        resumable=True,
         rounds_finished=sum(
             1 for attempt in core.attempts.attempts if attempt.phase == AttemptPhase.TERMINAL
         ),
@@ -279,6 +269,10 @@ def _unacknowledged_notes(bridge: AgentEvaluationBridge | None) -> StallNotes:
 def _ended_by(result: RunResultProposal, ending: EndReason) -> bool:
     """Whether the framework ended the run for ``ending`` (its reason starts with the ending)."""
     return result.reason.split(":", 1)[0] == ending.value
+
+
+class OperatorPaused(BaseException):
+    """The epoch drained successfully; the saved search resumes on relaunch."""
 
 
 class OperatorStopped(RunStopped):
@@ -371,6 +365,7 @@ def _adopted_candidate(shell: CoreRuntime) -> str | None:
 __all__ = [
     "CoreRunRefusedError",
     "RunEnd",
+    "StoredSteerArtifacts",
     "drive_core_run",
     "ensure_resumable",
 ]

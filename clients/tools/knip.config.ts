@@ -9,6 +9,16 @@ type WorkspacePolicy = NonNullable<KnipConfig['workspaces']>[string];
 // name instead of silently falling back to knip's default entry-point heuristics, which is how
 // `web` came to be audited against defaults meant for a library rather than a bundled app.
 const PACKAGE_POLICIES: Record<string, WorkspacePolicy> = {
+  'libs/connection': {
+    entry: ['src/index.ts', 'src/testing/index.ts', 'src/**/*.test.ts', 'node-tests/**/*.test.ts'],
+    project: ['src/**/*.ts', 'node-tests/**/*.ts'],
+  },
+  'libs/proto': {
+    entry: ['src/index.ts', 'tests/*.mjs'],
+    project: ['src/**/*.ts', '*.mjs', 'tests/*.mjs'],
+    // Tool-owned bindings are guarded by the proto regenerate-and-diff check.
+    ignore: ['src/generated/**'],
+  },
   'libs/contracts': {
     entry: ['src/**/*.test.ts'],
     project: ['src/**/*.ts'],
@@ -65,6 +75,8 @@ const PACKAGE_POLICIES: Record<string, WorkspacePolicy> = {
 // Repository tooling run by `node tools/scripts/...`; `*.test.mjs` runs under `node --test`. The
 // workspace root is not a package, so it is not part of the derived set.
 const ROOT_POLICY: WorkspacePolicy = {
+  // Invoked by root scripts/generate_proto.sh through buf.gen.yaml.
+  ignoreDependencies: ['@bufbuild/protoc-gen-es'],
   entry: ['tools/scripts/*.mjs'],
   project: ['tools/scripts/**/*.mjs'],
 };
@@ -96,7 +108,8 @@ for (const {name, directory, manifest} of layout.packages) {
 
 const config: KnipConfig = {
   // The protocol generator calls an external Python tool.
-  ignoreBinaries: ['uv'],
+  // Go is a system build tool, like uv; gateway builds report its absence explicitly.
+  ignoreBinaries: ['uv', 'go'],
   workspaces,
 };
 

@@ -18,10 +18,13 @@ under an older store restarts its sequences, and an event whose sequence does no
 predecessor's is read as the one after it. The events a page returns carry that sequence.
 
 The sidecar is an append-only log: a header line, then one line per event,
-``[offset, length, crc, sequence, span, execution, link]``, where ``offset`` and ``length``
+``[offset, length, crc, sequence, span, execution, link, kind]``, where ``offset`` and ``length``
 are the event's bytes in the journal without its newline, ``crc`` is their CRC-32,
-``sequence`` is its repaired cursor, and
-``link`` is ``[span, parent, invocation]`` for a span event and ``null`` otherwise. The
+``sequence`` is its repaired cursor, ``link`` is ``[span, parent, invocation]`` for a span event
+and ``null`` otherwise, and ``kind`` is the event's ``type`` (``null`` when it names none), which
+is how a read selects events by kind without reading the journal. A sidecar of another version
+(the version is in its header) is not trusted: the reader scans the journal, and the next run
+writer to open it rewrites it. The
 run's writer (``SpanIndexLog``) appends a line right after it appends the event, so the
 sidecar is never ahead of the journal except by an unflushed journal. A reader trusts the
 longest valid prefix of the sidecar whose first and last entries still match the journal
@@ -31,13 +34,14 @@ sidecar, while an append-only extension needs only a suffix scan. A missing or d
 causes a full scan.
 
 Public surface: ``SpanLink``, ``Entry``, ``entry_from_line``, ``JournalIndex``,
-``load_journal_index``, ``span_page``, ``read_documents``, ``StaleIndexError``,
+``load_journal_index``, ``span_page``, ``kind_page``, ``read_documents``, ``StaleIndexError``,
 ``SpanIndexLog`` and ``sidecar_path``.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 import zlib
 from bisect import bisect_left
 from dataclasses import dataclass, field, replace
@@ -47,7 +51,7 @@ from typing import TYPE_CHECKING, Final
 from server.host_api import HELPER_LINE_MAX_BYTES
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
     from pathlib import Path
 
     from pydantic import JsonValue
@@ -55,15 +59,18 @@ if TYPE_CHECKING:
 SIDECAR_SUFFIX: Final = ".spans"
 _IDENTITY_SUFFIX: Final = ".source"
 _FORMAT: Final = "vibesys-span-index"
-_VERSION: Final = 1
+_VERSION: Final = 2
 _HEADER: Final = (json.dumps([_FORMAT, _VERSION], separators=(",", ":")) + "\n").encode()
-_ENTRY_FIELDS: Final = 7
+_ENTRY_FIELDS: Final = 8
 _LINK_FIELDS: Final = 3
 _SPAN_EVENT_KINDS: Final = frozenset({"span_started", "span_updated", "span_ended"})
 _NEWLINE: Final = b"\n"
 _SIDECAR_BATCH_BYTES: Final = 1 << 20
 _SOURCE_STAMP_MAX_BYTES: Final = 256
 _SOURCE_STAT_FIELDS: Final = 5
+_TIMESTAMP_TICK_NS: Final = 2_000_000_000
+"""The coarsest file timestamp granularity assumed (ext3 and FAT keep seconds, FAT two): an edit
+made this soon after another can keep the same ``mtime_ns`` and ``ctime_ns``."""
 
 
 def sidecar_path(journal: Path) -> Path:
@@ -105,6 +112,38 @@ def _same_source(path: Path, expected: _SourceStat | None) -> bool:
     return current.size > expected.size or (
         current.mtime_ns == expected.mtime_ns and current.ctime_ns == expected.ctime_ns
     )
+
+
+def _is_racy(journal: Path, source: _SourceStat | None) -> bool:
+    """Whether a rewrite of ``journal`` after ``source`` was taken could keep ``source``'s stat.
+
+    The file system's own clock is the stamp's modification time (the stamp is written after
+    the journal event it describes). When the journal was modified within one timestamp tick
+    of it, or after it, an in-place edit of the same size can leave ``mtime_ns`` and
+    ``ctime_ns`` unchanged, so the stat alone cannot say the journal is unchanged. A missing
+    stamp is racy.
+    """
+    if source is None:
+        return True
+    try:
+        taken_ns = _identity_path(journal).stat().st_mtime_ns
+    except OSError:
+        return True
+    return taken_ns - source.mtime_ns < _TIMESTAMP_TICK_NS
+
+
+def _lines_intact(journal: Path, entries: Sequence[Entry]) -> bool:
+    """Whether every entry's line is still in ``journal`` with the checksum it was indexed with."""
+    try:
+        with journal.open("rb") as stream:
+            for entry in entries:
+                stream.seek(entry.offset)
+                line = stream.read(entry.length)
+                if len(line) != entry.length or zlib.crc32(line) != entry.crc:
+                    return False
+    except OSError:
+        return False
+    return True
 
 
 def _read_source_stamp(path: Path) -> _SourceStat | None:
@@ -168,6 +207,8 @@ class Entry:
     span: str | None
     execution: str | None
     link: SpanLink | None
+    kind: str | None
+    """The event's ``type``, or ``None`` when it names none."""
 
 
 def entry_from_line(offset: int, line: bytes) -> Entry | None:
@@ -198,11 +239,17 @@ def entry_from_line(offset: int, line: bytes) -> Entry | None:
         span=_text(document.get("span_id")),
         execution=execution,
         link=_span_link(document.get("data")),
+        kind=_kind(document.get("type")),
     )
 
 
 def _text(value: object) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _kind(value: object) -> str | None:
+    """The event type, shared between entries: a journal has a few dozen types and millions of events."""
+    return sys.intern(value) if isinstance(value, str) else None
 
 
 def _span_link(data: object) -> SpanLink | None:
@@ -252,6 +299,7 @@ class JournalIndex:
         """Start with no entries, or with the entries ``tables`` holds."""
         self._tables = _Tables() if tables is None else tables
         self._source: _SourceStat | None = None
+        self._racy = True
 
     @property
     def entries(self) -> list[Entry]:
@@ -295,19 +343,30 @@ class JournalIndex:
         """An index of the same entries that ``add`` can extend without changing this one."""
         copied = JournalIndex(self._tables.copy())
         copied._source = self._source
+        copied._racy = self._racy
         return copied
 
     def matches_source(self, journal: Path) -> bool:
-        """Whether ``journal`` is unchanged or an append-only extension since this index."""
-        return _same_source(journal, self._source)
+        """Whether ``journal`` is unchanged or an append-only extension since this index.
+
+        A stat that equals the snapshot's proves nothing while the snapshot is racy (see
+        ``_is_racy``), so every indexed line is then checked against its checksum.
+        """
+        if not _same_source(journal, self._source):
+            return False
+        if self._racy and _source_stat(journal) == self._source:
+            return _lines_intact(journal, self._tables.entries)
+        return True
 
     def record_source(self, journal: Path) -> None:
         """Remember the journal's file identity and stat after its indexed prefix was read."""
         self._source = _source_stat(journal)
+        self._racy = _is_racy(journal, self._source)
 
-    def set_source_snapshot(self, source: _SourceStat | None) -> None:
+    def set_source_snapshot(self, journal: Path, source: _SourceStat | None) -> None:
         """Use the source snapshot validated with a sidecar."""
         self._source = source
+        self._racy = _is_racy(journal, source)
 
     def tail(self, before: int | None, count: int, max_bytes: int) -> tuple[list[Entry], bool]:
         """The newest entries below sequence ``before`` (all when ``None``) one page carries.
@@ -386,6 +445,38 @@ def span_page(
         size += length
         stop += 1
     return entries[first:stop], len(entries), stop == len(entries)
+
+
+def kind_page(
+    index: JournalIndex, kinds: Collection[str], from_sequence: int, count: int, max_bytes: int
+) -> tuple[list[Entry], int, int, bool, int]:
+    """One page of the entries whose event type is in ``kinds``, from ``from_sequence``.
+
+    Returns the page's entries, how many entries of those kinds the journal holds and their bytes
+    (every page, so a reader can show progress), whether the page reaches the journal's end, and
+    the ``from_sequence`` of the next page.
+
+    A page holds at most ``count`` entries and ``max_bytes`` of journal, but always one when
+    there is one, so every read makes progress. A page that fills stops after its last entry;
+    one that does not has scanned to the journal's end, so its next page starts after the last
+    entry the index holds (a stretch of other kinds is never read twice, nor stalls a reader).
+    """
+    selected = [entry for entry in index.entries if entry.kind in kinds]
+    first = bisect_left(selected, from_sequence, key=_sequence_of)
+    size = 0
+    stop = first
+    while stop < len(selected) and stop - first < count:
+        length = selected[stop].length + 1
+        if stop > first and size + length > max_bytes:
+            break
+        size += length
+        stop += 1
+    page = selected[first:stop]
+    complete = stop == len(selected)
+    next_sequence = (
+        max(from_sequence, index.last_sequence + 1) if complete else page[-1].sequence + 1
+    )
+    return page, len(selected), sum(entry.length + 1 for entry in selected), complete, next_sequence
 
 
 class StaleIndexError(Exception):
@@ -471,7 +562,9 @@ def _checked_sidecar(journal: Path) -> tuple[JournalIndex, int]:
     source = _read_source_stamp(_identity_path(journal))
     if not _same_source(journal, source) or not _matches_journal(journal, index):
         return JournalIndex(), 0
-    index.set_source_snapshot(source)
+    index.set_source_snapshot(journal, source)
+    if index.entries and not index.matches_source(journal):
+        return JournalIndex(), 0
     return index, valid
 
 
@@ -539,6 +632,7 @@ def _encode_entry(entry: Entry) -> bytes:
         entry.span,
         entry.execution,
         link,
+        entry.kind,
     ]
     return json.dumps(fields, separators=(",", ":")).encode() + _NEWLINE
 
@@ -546,7 +640,7 @@ def _encode_entry(entry: Entry) -> bytes:
 def _decode_entry(fields: object) -> Entry | None:
     if not isinstance(fields, list) or len(fields) != _ENTRY_FIELDS:
         return None
-    offset, length, crc, sequence, span, execution, link = fields
+    offset, length, crc, sequence, span, execution, link, kind = fields
     if (
         type(offset) is not int
         or type(length) is not int
@@ -556,14 +650,16 @@ def _decode_entry(fields: object) -> Entry | None:
         or length == 0
         or not (span is None or isinstance(span, str))
         or not (execution is None or isinstance(execution, str))
+        or not (kind is None or isinstance(kind, str))
     ):
         return None
+    kind = _kind(kind)
     if link is None:
-        return Entry(offset, length, crc, sequence, span, execution, None)
+        return Entry(offset, length, crc, sequence, span, execution, None, kind)
     decoded = _decode_link(link)
-    return (
-        None if decoded is None else Entry(offset, length, crc, sequence, span, execution, decoded)
-    )
+    if decoded is None:
+        return None
+    return Entry(offset, length, crc, sequence, span, execution, decoded, kind)
 
 
 def _decode_link(link: object) -> SpanLink | None:

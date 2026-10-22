@@ -36,8 +36,6 @@ export interface RunPageLogs {
 
 /** What the Run screen asks of the app. */
 export interface RunPagePorts {
-  /** Stop the run (`force`: without waiting for a safe point); resolves false when it could not. */
-  stop(force: boolean): Promise<boolean>;
   /** Attach the live run's server `instance` to this window; resolves null, or why it could not. */
   attach(instance: string): Promise<string | null>;
   /** Let the attached run go. */
@@ -51,6 +49,12 @@ export interface RunPagePorts {
   readonly openSession: OpenSession;
   /** One page of the ended run's recorded events from `from`. */
   readHistory(from: number, max: number): Promise<HistoryReply>;
+  /**
+   * One page of the ended run's recorded events from `from`, with only the events the trace folds
+   * kept: the scrubber's earlier positions come from them (`trace-history.ts`), and the rest of a
+   * journal (most of its bytes) is dropped as the page is read.
+   */
+  readTrace(from: number, max: number): Promise<HistoryReply>;
   /** The run's summary: its run level without its history. */
   readSummary(status: RunStatus): Promise<SummaryReply>;
   readSpan(spanId: string, from: number, max: number): Promise<SpanDetailReply>;
@@ -119,15 +123,11 @@ class Followers {
 }
 
 /** Tells the screen the run did not take `request`: a refusal (a message), or the command failing to reach it. */
-function refusal(
-  request: {readonly kind: 'pause'} | {readonly kind: 'resume'; readonly when: string},
-  refused: unknown,
-  dispatch: Dispatch,
-): void {
+function refusal(kind: 'pause' | 'pause-now', refused: unknown, dispatch: Dispatch): void {
   if (refused === null) return;
   const message = refused instanceof Error ? refused.message : String(refused);
-  const waited = request.kind === 'resume' && request.when === 'capacity_returns';
-  dispatch({type: waited ? 'wait-refused' : 'command-refused', message});
+  if (kind === 'pause-now') dispatch({type: 'pause-now-failed'});
+  dispatch({type: 'command-refused', message});
 }
 
 /** How often the clock ticks at the live end: a second, the finest the screen writes. */
@@ -188,6 +188,29 @@ function readHistory(
   };
   void ports
     .readHistory(request.from, request.max)
+    .then(settle, (error: unknown) => settle({kind: 'failed', message: String(error)}));
+}
+
+/** Read one page of the trace's earlier events; a read that throws settles as a failed page. */
+function readTrace(
+  ports: RunPagePorts,
+  request: Extract<RunPageRequest, {readonly kind: 'read-trace'}>,
+  dispatch: Dispatch,
+  schedule: ScheduleTimeout,
+  cancels: Set<() => void>,
+): void {
+  const cancel = schedule(() => settle({kind: 'failed', message: 'The read timed out.'}), 30_000);
+  cancels.add(cancel);
+  let settled = false;
+  const settle = (reply: HistoryReply): void => {
+    if (settled) return;
+    settled = true;
+    cancel();
+    cancels.delete(cancel);
+    dispatch({type: 'trace-page', token: request.token, reply});
+  };
+  void ports
+    .readTrace(request.from, request.max)
     .then(settle, (error: unknown) => settle({kind: 'failed', message: String(error)}));
 }
 
@@ -387,12 +410,6 @@ export function createRunPageStore(
     const dispatch = live(raw);
     if (disposed) return;
     switch (request.kind) {
-      case 'stop':
-        void ports.stop(request.force).then(
-          stopped => (stopped ? undefined : dispatch({type: 'stop-failed'})),
-          () => dispatch({type: 'stop-failed'}),
-        );
-        return;
       case 'arm-bound':
       case 'cancel-bound':
         bounds.perform(request, dispatch);
@@ -414,14 +431,17 @@ export function createRunPageStore(
       case 'read-history':
         readHistory(ports, request, dispatch, schedule, cancels);
         return;
+      case 'read-trace':
+        readTrace(ports, request, dispatch, schedule, cancels);
+        return;
       case 'read-summary':
         readSummary(ports, request, dispatch, schedule, cancels);
         return;
       case 'pause':
-      case 'resume':
+      case 'pause-now':
         void sessions.command(request).then(
-          refused => refusal(request, refused, dispatch),
-          (error: unknown) => refusal(request, error, dispatch),
+          refused => refusal(request.kind, refused, dispatch),
+          (error: unknown) => refusal(request.kind, error, dispatch),
         );
         return;
       default:

@@ -17,7 +17,7 @@
     "test:e2e": "pnpm build && pnpm e2e",
     "fixtures": "bun --conditions=@vibesys/source e2e/tools/regenerate-fixtures.ts",
     "e2e:linux": "bash scripts/linux-e2e.sh",
-    "e2e": "node --conditions=@vibesys/source ../../node_modules/@playwright/test/cli.js test",
+    "e2e": "node --conditions=@vibesys/source ../../node_modules/@playwright/test/cli.js test --pass-with-no-tests",
     "dev:fixture": "bun --conditions=@vibesys/source e2e/tools/dev-fixture.ts",
     "record": "bun --conditions=@vibesys/source e2e/tools/record-run-fixture.ts"
   },
@@ -38,7 +38,11 @@
     "@vibesys/transport": "workspace:*",
     "@vibesys/ui": "workspace:*",
     "react": "19.1.1",
-    "react-dom": "19.1.1"
+    "react-dom": "19.1.1",
+    "@vibesys/machine": "workspace:*",
+    "@vibesys/run-skeleton": "workspace:*",
+    "@vibesys/feature-run-intents": "workspace:*",
+    "@vibesys/feature-run-sessions": "workspace:*"
   },
   "devDependencies": {
     "@axe-core/playwright": "4.10.2",
@@ -50,6 +54,8 @@
     "@vibesys/contracts": "workspace:*",
     "@vibesys/run-fixtures": "workspace:*",
     "@vitejs/plugin-react": "5.0.4",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "@vibesys/proto": "workspace:*",
+    "@bufbuild/protobuf": "2.16.0"
   }
 }

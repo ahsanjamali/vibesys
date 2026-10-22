@@ -193,7 +193,7 @@ InvocationId {"additionalProperties":false,"type":"object"}
 InvocationId.kind optional {"const":"invocation","default":"invocation","type":"string"}
 InvocationId.root required {"minLength":1,"pattern":"^\\S+$","type":"string"}
 InvocationRef {"additionalProperties":false,"type":"object"}
-InvocationRef.generation required {"$ref":"#/$defs/Generation"}
+InvocationRef.generation required {"minimum":0,"type":"integer"}
 InvocationRef.invocation_id required {"$ref":"#/$defs/InvocationId"}
 InvocationRef.session_id required {"$ref":"#/$defs/SessionId"}
 Kept {"additionalProperties":false,"type":"object"}
@@ -323,11 +323,11 @@ Queued {"additionalProperties":false,"type":"object"}
 Queued.order required {"exclusiveMinimum":0,"type":"integer"}
 Queued.submission required {"$ref":"#/$defs/Submission"}
 Reading {"additionalProperties":false,"type":"object"}
-Reading.direction optional {"anyOf":[{"$ref":"#/$defs/Direction"},{"type":"null"}],"default":null}
+Reading.direction optional {"anyOf":[{"enum":["max","min"],"type":"string"},{"type":"null"}],"default":null}
 Reading.metric required {"minLength":1,"type":"string"}
 Reading.repetitions optional {"default":1,"minimum":1,"type":"integer"}
 Reading.unit optional {"anyOf":[{"type":"string"},{"type":"null"}],"default":null}
-Reading.value required {"$ref":"#/$defs/Finite"}
+Reading.value required {"type":"number"}
 RecordState {"additionalProperties":false,"type":"object"}
 RecordState.accepted required {"items":{"$ref":"#/$defs/WorkPlan"},"type":"array"}
 RecordState.baseline required {"anyOf":[{"$ref":"#/$defs/Baseline"},{"type":"null"}]}
@@ -359,8 +359,9 @@ RejectionCode {"enum":["stale-view","identity-conflict","unknown-kind","unknown-
 ReplyError {"additionalProperties":false,"type":"object"}
 ReplyError.code required {"$ref":"#/$defs/ReplyErrorCode"}
 ReplyError.message optional {"default":"","maxLength":500,"type":"string"}
-ReplyError.path required {"items":{"anyOf":[{"type":"string"},{"type":"integer"}]},"type":"array"}
+ReplyError.path required {"items":{"$ref":"#/$defs/ReplyPathPart"},"type":"array"}
 ReplyErrorCode {"enum":["missing","unexpected","wrong-type","invalid-value","not-json"],"type":"string"}
+ReplyPathPart {"anyOf":[{"type":"string"},{"type":"integer"}]}
 RequestId {"additionalProperties":false,"type":"object"}
 RequestId.kind optional {"const":"request","default":"request","type":"string"}
 RequestId.root required {"minLength":1,"pattern":"^\\S+$","type":"string"}
@@ -398,8 +399,9 @@ SchemaRef {"additionalProperties":false,"type":"object"}
 SchemaRef.name required {"minLength":1,"type":"string"}
 SchemaRef.version required {"minimum":1,"type":"integer"}
 Scope {"additionalProperties":false,"type":"object"}
-Scope.generation required {"$ref":"#/$defs/Generation"}
-Scope.owner required {"discriminator":{"mapping":{"attempt":"#/$defs/AttemptId","run":"#/$defs/RunId"},"propertyName":"kind"},"oneOf":[{"$ref":"#/$defs/RunId"},{"$ref":"#/$defs/AttemptId"}]}
+Scope.generation required {"minimum":0,"type":"integer"}
+Scope.owner required {"$ref":"#/$defs/ScopeOwner"}
+ScopeOwner {"discriminator":{"mapping":{"attempt":"#/$defs/AttemptId","run":"#/$defs/RunId"},"propertyName":"kind"},"oneOf":[{"$ref":"#/$defs/RunId"},{"$ref":"#/$defs/AttemptId"}]}
 Seconds {"minimum":0,"type":"number"}
 SessionId {"additionalProperties":false,"type":"object"}
 SessionId.kind optional {"const":"session","default":"session","type":"string"}
@@ -434,7 +436,7 @@ Submission.key required {"type":"string"}
 Submission.kind required {"$ref":"#/$defs/WorkKind"}
 Submission.parent required {"$ref":"#/$defs/RevisionRef"}
 Submission.work_id required {"type":"string"}
-TurnFailureKind {"enum":["provider_failed","transport_lost","cancelled","provider_unavailable"],"type":"string"}
+TurnFailureKind {"enum":["provider_failed","transport_lost","cancelled","epoch_interrupted","provider_unavailable"],"type":"string"}
 UnappliedPart {"additionalProperties":false,"type":"object"}
 UnappliedPart.hypothesis_id required {"minLength":1,"type":"string"}
 UnappliedPart.part required {"minLength":1,"type":"string"}

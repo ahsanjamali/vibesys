@@ -11,7 +11,7 @@ on:
       - 'website/**'
       - '.github/workflows/website.yml'
   pull_request:
-    branches: [main]
+    branches: [main, 'transport/**']
   # GitHub merge queue: Required PR CI must report on the queue's temporary
   # gh-readonly-queue/... branch or the queue waits for it until timeout.
   merge_group:
@@ -39,6 +39,7 @@ jobs:
     outputs:
       python: ${{ steps.filter.outputs.python }}
       clients: ${{ steps.filter.outputs.clients }}
+      proto: ${{ steps.filter.outputs.proto }}
       examples: ${{ steps.filter.outputs.examples }}
       agent_image: ${{ steps.filter.outputs.agent_image }}
       real_tiers: ${{ steps.filter.outputs.real_tiers }}
@@ -48,6 +49,7 @@ jobs:
       native_languages: ${{ steps.filter.outputs.native_languages }}
       pnpm_packages: ${{ steps.filter.outputs.pnpm_packages }}
       impact: ${{ steps.filter.outputs.impact }}
+      gateway: ${{ steps.filter.outputs.gateway }}
       # The per-file test seconds the shards balance on, read once here so that
       # every shard of a run sees the same record (a shard that read a newer
       # cache entry than its siblings would break the partition of the suite).
@@ -165,7 +167,13 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Record when this job's cancel clock started
+        run: echo "VIBESYS_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Pass the pytest cancel deadline
+        run: python3 scripts/pytest_job_deadline.py
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -226,18 +234,39 @@ jobs:
   # Required PR CI lists all four.
   clients-quality:
     needs: changes
-    if: needs.changes.outputs.clients == 'true'
+    if: needs.changes.outputs.clients == 'true' || needs.changes.outputs.proto == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
+      - name: Record when this job's cancel clock started
+        run: echo "VIBESYS_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The protobuf compatibility check needs the actual common ancestor.
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Pass the pytest cancel deadline
+        run: python3 scripts/pytest_job_deadline.py
 
       - name: Set up the client workspace
         uses: ./.github/actions/setup-clients
 
       - name: Check TypeScript packages
+        if: needs.changes.outputs.clients == 'true'
         run: ./support/repoctl/repoctl run-checks --group clients_quality
+
+      # Reuse this job's Node, Python and Go setup rather than adding a runner.
+      - name: Check protobuf contracts
+        if: needs.changes.outputs.proto == 'true'
+        env:
+          # Compare against the pull request's merge base (main outside a PR).
+          BASE_BRANCH: ${{ github.base_ref || 'main' }}
+        run: |
+          git fetch --no-tags origin "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}"
+          PROTO_BASE_REF="origin/${BASE_BRANCH}" ./support/repoctl/repoctl run-checks --group proto
 
   clients-tests:
     needs: changes
@@ -273,10 +302,10 @@ jobs:
 
   # Every spec of the three Playwright apps, split across the runners in `matrix.shard`
   # (`VIBESYS_E2E_SHARD`, see clients/tools/e2e/shard.mts) so no job nears the 10-minute
-  # check limit. The desktop shell's ~530 specs were 7 of the unsharded job's 9 minutes; its
-  # specs are spread by test, and the other two apps' files land on shard 1. Each leg pays
-  # ~50 s of setup, so the shard count trades summed runner time against wall time: five keep
-  # every leg near 3 minutes. The count is the length of the list (`strategy.job-total`);
+  # check limit. One duration-weighted file plan spans all three apps, so the Electron and
+  # gallery files do not pile onto the shell's first slice. New specs join the plan even
+  # before they have a recorded timing. Each leg pays setup, so five trade summed runner
+  # time against wall time. The count is the length of the list (`strategy.job-total`);
   # `fail-fast: false` lets a red shard finish its siblings so one run lists every failure.
   clients-e2e:
     needs: changes
@@ -293,22 +322,8 @@ jobs:
 
       - name: Set up the client workspace
         uses: ./.github/actions/setup-clients
-
-      - name: Resolve the Playwright version
-        id: playwright
-        working-directory: clients
-        run: echo "version=$(pnpm --filter @vibesys/app-desktop-main exec playwright --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
-
-      # The browser download only; the system libraries below come from apt and are not cached.
-      - name: Cache the Playwright browsers
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}-${{ steps.playwright.outputs.version }}
-
-      - name: Install Chromium for the desktop smoke test
-        working-directory: clients
-        run: pnpm --filter @vibesys/app-desktop-main exec playwright install --with-deps chromium
+          playwright: true
 
       - name: Test the desktop app (shard ${{ matrix.shard }} of ${{ strategy.job-total }})
         env:
@@ -316,13 +331,14 @@ jobs:
           # The downloaded Electron runtime's SUID helper cannot have Chromium's required root
           # ownership on a hosted runner. This opt-out is scoped to the E2E child process.
           VIBESYS_ELECTRON_E2E_DISABLE_CHROMIUM_SANDBOX: "1"
-        # Electron's native windows require a display; Playwright's dependency install above
-        # provides Xvfb on this Linux runner. The wrapper owns the display for this one check group.
+        # Electron's native windows require a display. The setup action's Playwright
+        # dependency install provides Xvfb on this Linux runner. The wrapper owns the
+        # display for this one check group.
         run: xvfb-run -a ./support/repoctl/repoctl run-checks --group clients_e2e
 
       # A gallery screenshot that differs from its baseline leaves the actual and the diff here, so
-      # a reviewer can see the change without rerunning it in the Linux image. The gallery's one spec
-      # file runs on shard 1, so only that leg has files; the others upload nothing.
+      # a reviewer can see the change without rerunning it in the Linux image. Only the shard
+      # assigned the gallery spec has files; the others upload nothing.
       - name: Upload the gallery's screenshot differences
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -360,13 +376,10 @@ jobs:
       # legible failure in minutes instead of a job that burns hours.
       - name: Install managed-candidate containment dependency
         if: contains(fromJSON(needs.changes.outputs.native_targets), 'resources/evaluators/microservice')
-        timeout-minutes: 10
-        env:
-          DEBIAN_FRONTEND: noninteractive
-          NEEDRESTART_MODE: a
+        timeout-minutes: 3
         run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a timeout --kill-after=5s 60s apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=10 update
+          sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a timeout --kill-after=5s 60s apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=10 install -y bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
       - name: Set up Rust
@@ -379,6 +392,28 @@ jobs:
         env:
           NATIVE_TARGETS: ${{ needs.changes.outputs.native_targets }}
         run: ./support/repoctl/repoctl run-native --targets-json "$NATIVE_TARGETS"
+
+  # Runs on every push to main, not only when the gateway changed: a cache is
+  # readable only from its own ref and the default branch, so the module and build
+  # caches that pull-request and merge-queue runs restore are the ones a passing
+  # main run saved. Without it a merge-queue run always starts cold.
+  gateway:
+    needs: changes
+    if: needs.changes.outputs.gateway == 'true' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: gateway/go.mod
+          cache-dependency-path: gateway/go.sum
+
+      - name: Check the host gateway
+        run: ./support/repoctl/repoctl run-checks --group gateway_checks
 
   impact-tool:
     needs: changes
@@ -414,7 +449,13 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Record when this job's cancel clock started
+        run: echo "VIBESYS_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Pass the pytest cancel deadline
+        run: python3 scripts/pytest_job_deadline.py
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -455,7 +496,13 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Record when this job's cancel clock started
+        run: echo "VIBESYS_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Pass the pytest cancel deadline
+        run: python3 scripts/pytest_job_deadline.py
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -498,7 +545,13 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6]
 
     steps:
+      - name: Record when this job's cancel clock started
+        run: echo "VIBESYS_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Pass the pytest cancel deadline
+        run: python3 scripts/pytest_job_deadline.py
 
       - name: Set up repoctl
         uses: ./.github/actions/setup-repoctl
@@ -532,7 +585,13 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Record when this job's cancel clock started
+        run: echo "VIBESYS_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Pass the pytest cancel deadline
+        run: python3 scripts/pytest_job_deadline.py
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -620,7 +679,13 @@ jobs:
         # slowest near three minutes (see docs/contributing/testing-map.md).
         shard: [1, 2, 3]
     steps:
+      - name: Record when this job's cancel clock started
+        run: echo "VIBESYS_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Pass the pytest cancel deadline
+        run: python3 scripts/pytest_job_deadline.py
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -792,10 +857,16 @@ jobs:
     timeout-minutes: 6
 
     steps:
+      - name: Record when this job's cancel clock started
+        run: echo "VIBESYS_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           filter: blob:none
+
+      - name: Pass the pytest cancel deadline
+        run: python3 scripts/pytest_job_deadline.py
 
       - name: Select the tests this pull request adds or changes
         id: select
@@ -853,20 +924,23 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Record when this job's cancel clock started
+        run: echo "VIBESYS_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Pass the pytest cancel deadline
+        run: python3 scripts/pytest_job_deadline.py
 
       # Bounded for the same reason as the containment-dependency install in
       # `queue-native`: this apt install intermittently hangs on these runners
       # instead of failing, and an unbounded step reports nothing while it
       # burns the job's budget.
       - name: Install bubblewrap
-        timeout-minutes: 10
-        env:
-          DEBIAN_FRONTEND: noninteractive
-          NEEDRESTART_MODE: a
+        timeout-minutes: 3
         run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap dbus-user-session
+          sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a timeout --kill-after=5s 60s apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=10 update
+          sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a timeout --kill-after=5s 60s apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=10 install -y bubblewrap dbus-user-session
           # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor;
           # relax it so bwrap can create the namespace on the runner.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
@@ -913,7 +987,13 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Record when this job's cancel clock started
+        run: echo "VIBESYS_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Pass the pytest cancel deadline
+        run: python3 scripts/pytest_job_deadline.py
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -946,14 +1026,21 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Record when this job's cancel clock started
+        run: echo "VIBESYS_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Pass the pytest cancel deadline
+        run: python3 scripts/pytest_job_deadline.py
 
       # The host-side job confinement the tier exercises needs bubblewrap; see
       # the sandbox-linux job for why the AppArmor userns restriction is lifted.
       - name: Install bubblewrap
+        timeout-minutes: 3
         run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a timeout --kill-after=5s 60s apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=10 update
+          sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a timeout --kill-after=5s 60s apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=10 install -y bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
       - name: Install uv
@@ -1017,7 +1104,13 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Record when this job's cancel clock started
+        run: echo "VIBESYS_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Pass the pytest cancel deadline
+        run: python3 scripts/pytest_job_deadline.py
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -1149,6 +1242,7 @@ jobs:
       - queue-native
       - stitch
       - impact-tool
+      - gateway
       - validate-examples
       - validate-examples-cpu-check
       - native-evaluator-examples
@@ -1212,6 +1306,7 @@ jobs:
       - clients-e2e
       - queue-native
       - impact-tool
+      - gateway
       - validate-examples
       - validate-examples-cpu-check
       - native-evaluator-examples

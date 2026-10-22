@@ -274,8 +274,8 @@ const responsePayloadSchema: Record<string, unknown> = {
       "enum": [
         "steer",
         "pause",
+        "pause_now",
         "resume",
-        "stop",
         "withdraw",
         "cancel_attempt",
         "cancel_item",

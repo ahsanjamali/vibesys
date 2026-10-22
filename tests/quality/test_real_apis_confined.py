@@ -904,10 +904,17 @@ REAL_API_EDGES: dict[Key, str] = {
     **{
         (relative, "fs_sync"): f"{_OWN_STORE}: {what}"
         for relative, what in (
+            ("libs/vs-runlog/src/vs_runlog/_file.py", "durable run.log appends"),
+            ("libs/vs-runlog/src/vs_runlog/_atomic.py", "atomic head and keyframe publication"),
+            ("libs/vs-runlog/src/vs_runlog/_lock.py", "the run lifetime lock"),
             ("libs/vs-project/src/vs_project/_operator_key.py", "the operator key file"),
             ("libs/vs-project/src/vs_project/_state.py", "the project state lock file"),
             ("libs/vs-project/src/vs_project/_state_io.py", "atomic state file replacement"),
             ("libs/vs-project/src/vs_project/_state_store.py", "LocalStateStore's lock file"),
+            (
+                "libs/vs-project/src/vs_project/_admission.py",
+                "FileAdmissionStore's identity and target locks",
+            ),
             ("libs/vs-runtime/src/vs_runtime/_artifact_store.py", "artifact files and receipts"),
             ("libs/vs-runtime/src/vs_runtime/_receipt_store.py", "the receipt namespace lock"),
             ("libs/vs-runtime/src/vs_runtime/_slot_meter.py", "the lease ledger"),
@@ -1206,6 +1213,34 @@ type Edge = tuple[EdgeKind, str]
 # parse JSON or TOML directly. Everything else asks the owner of the data. Keep one line
 # per module: its kind, and a note naming the data.
 FILE_IO_EDGE_MODULES: dict[str, Edge] = {
+    "libs/vs-project/src/vs_project/_fingerprint.py": (
+        EdgeKind.INPUT_LOADER,
+        "Project's portable input fingerprint reader, extracted from its state implementation",
+    ),
+    "src/entrypoints/chat_session.py": (
+        EdgeKind.PROCESS_BOUNDARY,
+        "the detached session's process output log",
+    ),
+    "src/vibesys/chat/_session.py": (
+        EdgeKind.LOG,
+        "session log shell: reads the run head and its own answer blobs through Project paths",
+    ),
+    "libs/vs-runlog/src/vs_runlog/_atomic.py": (
+        EdgeKind.LOG,
+        "durable atomic publication of run store protobuf files",
+    ),
+    "libs/vs-runlog/src/vs_runlog/_lock.py": (
+        EdgeKind.LOG,
+        "the run.lock lifetime descriptor",
+    ),
+    "libs/vs-runlog/src/vs_runlog/_file.py": (
+        EdgeKind.LOG,
+        "the run.log file sink and recovery reader; framing stays in the pure _framing module",
+    ),
+    "src/vibesys/run/runlog_conversion.py": (
+        EdgeKind.LOG,
+        "the one-shot run.log sink that reads the authoritative JSONL journal and stages conversion",
+    ),
     "libs/vs-agent/src/vs_agent/images.py": (
         EdgeKind.GENERATOR,
         "content-addresses the build context it hands to docker build",
@@ -1285,9 +1320,13 @@ FILE_IO_EDGE_MODULES: dict[str, Edge] = {
     ),
     "libs/vs-project/src/vs_project/_state_io.py": (
         EdgeKind.STORE,
-        "atomic, durable state document writes and reads",
+        "atomic, durable state documents and atomic host run discovery links",
     ),
     "libs/vs-project/src/vs_project/_state_store.py": (EdgeKind.STORE, "the local StateStore"),
+    "libs/vs-project/src/vs_project/_admission.py": (
+        EdgeKind.STORE,
+        "retained admission receipts and scoped identity/target exclusion",
+    ),
     "libs/vs-project/src/vs_project/_workspace_tree.py": (
         EdgeKind.AGENT_WORKSPACE,
         "every host read or write of an agent-chosen path, walked by descriptor",
@@ -1504,6 +1543,10 @@ FILE_IO_EDGE_MODULES: dict[str, Edge] = {
     "src/launch/scripted_agents.py": (
         EdgeKind.AGENT_WORKSPACE,
         "the scripted implementer's source edits and the reads of the candidate it and the judge make",
+    ),
+    "src/vibesys/api/host_operations/_candidate.py": (
+        EdgeKind.INPUT_LOADER,
+        "read-only loader of candidate checkout metadata (pyproject and git HEAD)",
     ),
     "src/vibesys/config.py": (EdgeKind.INPUT_LOADER, "VibeSys configuration"),
     "src/vibesys/domains/rendering.py": (EdgeKind.PACKAGED_RESOURCE, "role templates"),
@@ -1726,6 +1769,10 @@ PARSE_EDGE_MODULES: dict[str, tuple[ParseKind, str]] = {
     "libs/vs-agent/src/vs_agent/fake_client.py": (
         ParseKind.FAKE,
         "a scripted reply value, as the response model",
+    ),
+    "libs/vs-core/src/vs_core/_corevalue.py": (
+        ParseKind.MODEL_HOOK,
+        "the generated value's Pydantic-compatible parse method; its ingress callers remain scanned",
     ),
     "libs/vs-core/src/vs_core/_registry.py": (
         ParseKind.OWN_STORE,

@@ -24,7 +24,12 @@ from vs_runtime._agent_evaluation import (
     SnapshotWorkspace,
 )
 from vs_runtime._capture_command_operation import CaptureCommandOwner
-from vs_runtime._control_bridge import OperatorInbox, RunControlBridge, SteerArtifacts
+from vs_runtime._control_bridge import (
+    IntentJournal,
+    OperatorInbox,
+    RunControlBridge,
+    SteerArtifacts,
+)
 from vs_runtime._core_loop import (
     AdmissionBusyError,
     CommitObserver,
@@ -49,7 +54,6 @@ from vs_runtime._core_preflight import (
     CoreResumeError,
     ResolvedCoreResume,
     ResumeDiagnostic,
-    reject_ended_resume,
     reject_legacy_resume,
     resolve_core_resume,
 )
@@ -324,6 +328,7 @@ __all__ = [
     "Indeterminate",
     "Inspected",
     "Inspection",
+    "IntentJournal",
     "InterpretEvidenceOwner",
     "IssueBoardOwner",
     "JobRecord",
@@ -460,7 +465,6 @@ __all__ = [
     "owner_key",
     "production_owners",
     "receipt_executor_kinds",
-    "reject_ended_resume",
     "reject_legacy_resume",
     "reply_variable",
     "report_turns",

@@ -153,6 +153,7 @@ class RunStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     STOPPED = "stopped"
+    PARKED = "parked"
 
 
 class RunResult(BaseModel):
@@ -163,7 +164,9 @@ class RunResult(BaseModel):
     run_id: str
     loop: str
     succeeded: bool
-    status: Literal[RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.STOPPED] = RunStatus.FAILED
+    status: Literal[RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.STOPPED, RunStatus.PARKED] = (
+        RunStatus.FAILED
+    )
     failure: RunFailure | None = None
     uncompared: bool = False
     """The run adopted a candidate never compared with the input: the input failed its own
@@ -200,9 +203,9 @@ class RoundFailureSummary(BaseModel):
 
     ``kind`` is a plain string rather than a policy's own closed failure
     enum: this module stays below every policy in the dependency graph, so it
-    carries the enum's value, not the enum. ``WORKSTREAM_FINISHED``'s wiring
-    is the one place that turns it back into the wire's
-    ``WorkstreamFailureKind``.
+    carries the normalized ``WorkstreamFailureKind`` value. Each policy owns
+    its exhaustive translation before constructing this summary; the run
+    validates that value when publishing ``WORKSTREAM_FINISHED``.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)

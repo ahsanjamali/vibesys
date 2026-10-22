@@ -64,6 +64,7 @@ from ._submissions import (
     rejected,
     submission_released,
 )
+from ._turn_permit import _executing_turn, _Facts, _permit_for_turn
 from .types.attempts import (
     AttemptEvaluationHistoryUpdated,
     CloseAttemptScope,
@@ -449,8 +450,13 @@ def _agent_requested(
     if any(call.call_id == event.call_id for call in state.agent_calls):
         return AreaChange(state=state)
     identity = identity_of(event.plan)
+    facts = _Facts(context.run, context.sessions, context.records, state)
+    requester = _executing_turn(context.sessions, event.scope)
+    permit = _permit_for_turn(facts, requester, live=True)
     rejection: AgentRejection | None = None
-    if not continues_admitted_work(context.run):
+    if not continues_admitted_work(context.run) and not (
+        context.run.status == RunStatus.DRAINING and permit is not None
+    ):
         rejection = AgentRejection.RUN_STOPPING
     elif not isinstance(current(context, event.scope), Proven):
         rejection = AgentRejection.NOT_ADMITTED
@@ -464,7 +470,15 @@ def _agent_requested(
         call = AgentCall.answered(event, request_id, deadline_at, repeat=True)
         return _recorded(AreaChange(state=state), call)
     origin = Origin(
-        event.scope, None, capped(event), base=base_of(context, event.scope, event.plan)
+        event.scope,
+        None,
+        capped(
+            event,
+            deadline_at=None if permit is None else permit.deadline_at,
+            now_at=context.run.now_at,
+        ),
+        base=base_of(context, event.scope, event.plan),
+        requested_by=requester,
     )
     change = _admit(state, context, origin, event.plan, identity.value)
     outbound = next((r for r in change.requests if isinstance(r.request, SubmitMeasurement)), None)
@@ -1827,7 +1841,9 @@ def cancel_settled(records: RecordsState, run: RunState, resource: ResourceId) -
     end, as it did before any retry.
     """
     cancels = tuple(
-        row for row in records.about_resource(resource) if isinstance(row.request, CancelOwnedJob)
+        row
+        for row in records.about_resource(resource)
+        if isinstance(row.request, CancelOwnedJob) and not row.request.for_park
     )
     blocked = sum(
         1 for row in cancels if row.phase == RequestPhase.BLOCKED or row.failure is not None

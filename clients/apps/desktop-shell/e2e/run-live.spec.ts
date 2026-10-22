@@ -9,6 +9,7 @@ import {
 import {installFakeRun} from './fake-run.js';
 import {prototypeRun} from './fake-run-data.js';
 import {type FakeServerSeed, installFakeServer} from './fake-server.js';
+import {addInitScripts, initScript} from './init-scripts.js';
 import {STARTED_AT} from './started-at.js';
 
 /**
@@ -92,11 +93,13 @@ test.use({colorScheme: 'dark'});
 test('a live run folds its trace into the ideas, the failed listed and hideable', async ({
   page,
 }) => {
-  await page.addInitScript(installFakeBridge, SEED);
-  await page.addInitScript(installFakeProjectRuns, SEED);
-  await page.addInitScript(installFakeMachines, SEED);
-  await page.addInitScript(installFakeRun, {streams: [], text: {}});
-  await page.addInitScript(installFakeServer, prototypeRun(RUN_ID));
+  await addInitScripts(page, [
+    initScript(installFakeBridge, SEED),
+    initScript(installFakeProjectRuns, SEED),
+    initScript(installFakeMachines, SEED),
+    initScript(installFakeRun, {streams: [], text: {}}),
+    initScript(installFakeServer, prototypeRun(RUN_ID)),
+  ]);
   await page.goto('./shell.html');
   await page
     .getByRole('main')
@@ -119,11 +122,13 @@ test('a live run folds its trace into the ideas, the failed listed and hideable'
 });
 
 test('a run that has tried no idea yet says what will appear, not a guess', async ({page}) => {
-  await page.addInitScript(installFakeBridge, SEED);
-  await page.addInitScript(installFakeProjectRuns, SEED);
-  await page.addInitScript(installFakeMachines, SEED);
-  await page.addInitScript(installFakeRun, {streams: [], text: {}});
-  await page.addInitScript(installFakeServer, SERVER);
+  await addInitScripts(page, [
+    initScript(installFakeBridge, SEED),
+    initScript(installFakeProjectRuns, SEED),
+    initScript(installFakeMachines, SEED),
+    initScript(installFakeRun, {streams: [], text: {}}),
+    initScript(installFakeServer, SERVER),
+  ]);
   await page.goto('./shell.html');
   await page
     .getByRole('main')
@@ -133,14 +138,14 @@ test('a run that has tried no idea yet says what will appear, not a guess', asyn
   await expect(page.getByText('nothing measured yet')).toBeVisible();
 });
 
-test('a live run pauses and resumes from the header over its session, and is let go', async ({
-  page,
-}) => {
-  await page.addInitScript(installFakeBridge, SEED);
-  await page.addInitScript(installFakeProjectRuns, SEED);
-  await page.addInitScript(installFakeMachines, SEED);
-  await page.addInitScript(installFakeRun, {streams: [], text: {}});
-  await page.addInitScript(installFakeServer, SERVER);
+test('a live run drains from the header over its session, and is let go', async ({page}) => {
+  await addInitScripts(page, [
+    initScript(installFakeBridge, SEED),
+    initScript(installFakeProjectRuns, SEED),
+    initScript(installFakeMachines, SEED),
+    initScript(installFakeRun, {streams: [], text: {}}),
+    initScript(installFakeServer, SERVER),
+  ]);
   await page.goto('./shell.html');
   const nav = page.getByRole('navigation', {name: 'VibeSys'});
   await page
@@ -148,20 +153,18 @@ test('a live run pauses and resumes from the header over its session, and is let
     .getByRole('button', {name: /^queue-rs · mpmc/})
     .click();
 
-  const pause = page.getByRole('button', {name: 'Pause'});
+  const pause = page.getByRole('button', {name: 'Pause', exact: true});
   await expect(pause).toBeEnabled();
   await expect.poll(() => commands(page)).toEqual([`attach ${INSTANCE}`]);
   await pause.click();
-  await expect.poll(() => commands(page)).toContain('command.pause');
+  await expect.poll(() => commands(page)).toContain('command.control:pause');
 
   await push(page, listed([server('paused', 'user')]));
   await expect(page.getByRole('main').getByText('Paused by you')).toBeVisible();
-  const resume = page.getByRole('button', {name: 'Resume'});
-  await expect(resume).toBeEnabled();
+  await expect(page.getByRole('button', {name: 'Resume', exact: true})).toHaveCount(0);
+  await expect(page.getByRole('button', {name: 'Pause now', exact: true})).toBeEnabled();
   expect((await new AxeBuilder({page}).analyze()).violations).toEqual([]);
   if (shots !== undefined) await page.screenshot({path: `${shots}/ink-live-paused.png`});
-  await resume.click();
-  await expect.poll(() => commands(page)).toContain('command.resume');
 
   await nav.getByRole('button', {name: 'Settings'}).click();
   await expect.poll(() => commands(page)).toContain('release');

@@ -29,6 +29,7 @@ from .common import (
     RevisionNumber,
     RunFacts,
     RunId,
+    RunPark,
     RunStatus,
     SchemaRef,
     Seconds,
@@ -117,8 +118,11 @@ class RunState(Value):
     run_id: RunId
     generation: Count = 0
     status: RunStatus = RunStatus.RUNNING
+    park: RunPark | None = None
     now_at: Seconds
     deadline_at: Seconds
+    duration_seconds: Seconds | None = Field(default=None, gt=0)
+    """Original epoch duration; older records use the supplied run configuration once."""
     facts: RunFacts
     capabilities: Capabilities = Capabilities()
     limits: Limits
@@ -230,6 +234,18 @@ class RunControlEvent(Value):
         return self
 
 
+class EpochResumed(Value):
+    """An operator opens fresh run authority, then reconciles retained work.
+
+    Writer recovery uses ``RecoveryStarted`` and preserves the run's closure and
+    journal. Only this input authorizes constructing a successor run.
+    """
+
+    kind: Literal["epoch_resumed"] = "epoch_resumed"
+    epoch: Count
+    now_at: Seconds
+
+
 class ControlChanged(Value):
     """Control changed lifecycle contract."""
 
@@ -247,6 +263,7 @@ class StopLiftRecorded(Value):
 
     kind: Literal["stop_lift_recorded"] = "stop_lift_recorded"
     control: ControlInput
+    new_epoch: bool = Field(default=False, exclude_if=lambda value: not value)
 
 
 class RunEnded(Value):
@@ -270,7 +287,8 @@ type CoreEvent = Annotated[
     | EvaluationEvent
     | SettlementEvent
     | RecordsEvent
-    | RunControlEvent,
+    | RunControlEvent
+    | EpochResumed,
     Field(discriminator="kind"),
 ]
 type StrategyEvent = Annotated[

@@ -2,7 +2,7 @@ import {describe, expect, test} from 'bun:test';
 import {join} from 'node:path';
 import {type ConnectionLease, ConnectionManager} from '@vibesys/connection';
 import {FAKE_MODEL_CATALOGUE, FakeLink, record} from '@vibesys/connection/testing';
-import type {RunSummary} from '@vibesys/contracts/host-helper';
+import {RUN_EVENT_TYPES_BY_KINDS, type RunSummary} from '@vibesys/contracts/host-helper';
 import {type HostId, type HostListing, hostKey} from '@vibesys/hosts';
 import {remember, SettingsStore, settingsFor, withHostSettings} from '@vibesys/settings';
 import {FakeSettingsFilesystem} from '@vibesys/settings/testing';
@@ -346,6 +346,180 @@ describe('Hosts.complete', () => {
       1,
     );
   });
+
+  test('uses the registry when transport v2 is on and does not open the helper', async () => {
+    const manager = new ConnectionManager({
+      linkFor: () => {
+        throw new Error('the helper must stay closed');
+      },
+      appVersion: 'test',
+      scheduleTimeout: new FakeClock().scheduleTimeout,
+      log: () => {},
+    });
+    const hosts = new Hosts({
+      manager,
+      settings: new SettingsStore({
+        settingsPath: '/settings/hosts.json',
+        recentPath: '/settings/recent.json',
+        preferencesPath: '/settings/preferences.json',
+        filesystem: new FakeSettingsFilesystem(),
+        log: () => {},
+      }),
+      localCheckout: '/bundled',
+      sshConfigPath: '/missing',
+      log: () => {},
+      push: () => {},
+      retire: () => {},
+      transportV2: async () => true,
+      setup: {
+        inspectCandidate: async () => {
+          throw new Error('unused');
+        },
+        completePaths: async () => ({
+          directory: '/manual',
+          truncated: false,
+          entries: [{name: 'project', path: '/manual/project', checkout: true, project: false}],
+        }),
+      },
+    });
+    await using _manager = manager;
+    await expect(hosts.complete(LOCAL, '/manual/')).resolves.toEqual({
+      kind: 'listed',
+      directory: '/manual',
+      entries: [{name: 'project', path: '/manual/project', checkout: true, project: false}],
+      truncated: false,
+    });
+  });
+
+  test('refuses setup when transport v2 is on and the registry setup is missing', async () => {
+    const manager = new ConnectionManager({
+      linkFor: () => {
+        throw new Error('the helper must stay closed');
+      },
+      appVersion: 'test',
+      scheduleTimeout: new FakeClock().scheduleTimeout,
+      log: () => {},
+    });
+    const hosts = new Hosts({
+      manager,
+      settings: new SettingsStore({
+        settingsPath: '/settings/hosts.json',
+        recentPath: '/settings/recent.json',
+        preferencesPath: '/settings/preferences.json',
+        filesystem: new FakeSettingsFilesystem(),
+        log: () => {},
+      }),
+      localCheckout: '/bundled',
+      sshConfigPath: '/missing',
+      log: () => {},
+      push: () => {},
+      retire: () => {},
+      transportV2: async () => true,
+    });
+    await using _manager = manager;
+    await expect(hosts.complete(LOCAL, '/manual/')).rejects.toThrow(
+      'run transport v2 is on and the registry setup is missing',
+    );
+  });
+});
+
+describe('Hosts.setCheckout transport v2', () => {
+  function v2Hosts(setup: NonNullable<ConstructorParameters<typeof Hosts>[0]['setup']>): {
+    readonly hosts: Hosts;
+    readonly settings: SettingsStore;
+    readonly manager: ConnectionManager;
+  } {
+    const settings = new SettingsStore({
+      settingsPath: '/settings/hosts.json',
+      recentPath: '/settings/recent.json',
+      preferencesPath: '/settings/preferences.json',
+      filesystem: new FakeSettingsFilesystem(),
+      log: () => {},
+    });
+    const manager = new ConnectionManager({
+      linkFor: () => {
+        throw new Error('the helper must stay closed');
+      },
+      appVersion: 'test',
+      scheduleTimeout: new FakeClock().scheduleTimeout,
+      log: () => {},
+    });
+    return {
+      settings,
+      manager,
+      hosts: new Hosts({
+        manager,
+        settings,
+        localCheckout: '/bundled',
+        sshConfigPath: '/missing',
+        log: () => {},
+        push: () => {},
+        retire: () => {},
+        transportV2: async () => true,
+        setup,
+      }),
+    };
+  }
+
+  test('saves a found compatible checkout without starting the helper', async () => {
+    const {hosts, settings, manager} = v2Hosts({
+      completePaths: async () => {
+        throw new Error('unused');
+      },
+      inspectCandidate: async (_id, path, revision) => {
+        if (revision !== 1n) throw new Error('stale selection');
+        return {
+          state: 'found',
+          root: path,
+          version: '0.1.1',
+          commit: null,
+          dirty: null,
+          compatible: true,
+        };
+      },
+    });
+    await using _manager = manager;
+    await expect(hosts.setCheckout(LOCAL, '/candidate', {owner: 'doc', sequence: 1})).resolves.toBe(
+      '/candidate',
+    );
+    expect((await settings.hosts()).settings.hosts['local']?.checkout).toBe('/candidate');
+  });
+
+  test('a cancel during inspection does not save the checkout', async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    let started: () => void = () => {};
+    const startedPromise = new Promise<void>(resolve => {
+      started = resolve;
+    });
+    const {hosts, settings, manager} = v2Hosts({
+      completePaths: async () => {
+        throw new Error('unused');
+      },
+      inspectCandidate: async (_id, _path, _revision, signal) => {
+        started();
+        await gate;
+        if (signal.aborted) throw new Error('operation cancelled');
+        return {
+          state: 'found',
+          root: '/candidate',
+          version: '0.1.1',
+          commit: null,
+          dirty: null,
+          compatible: true,
+        };
+      },
+    });
+    await using _manager = manager;
+    const pending = hosts.setCheckout(LOCAL, '/candidate', {owner: 'doc', sequence: 1});
+    await startedPromise;
+    await hosts.cancelCheckout({owner: 'doc', sequence: 1});
+    release();
+    await expect(pending).rejects.toThrow('the checkout change was cancelled');
+    expect((await settings.hosts()).settings.hosts['local']).toBeUndefined();
+  });
 });
 
 describe('Hosts.harnesses', () => {
@@ -500,6 +674,86 @@ describe('Hosts.readEvents page size', () => {
   });
 });
 
+describe('Hosts.readEvents of one kind', () => {
+  const OTHER = ['control', 'agent_output_chunk', 'turn_usage_recorded'];
+  const TRACE = RUN_EVENT_TYPES_BY_KINDS.trace;
+
+  /** `length` events numbered from 1 whose types a `seed` picks from the trace's and from the rest. */
+  function journalOf(seed: number, length: number): Record<string, unknown>[] {
+    const types = [...TRACE, ...OTHER, ...OTHER, ...OTHER];
+    let state = seed;
+    return Array.from({length}, (_, index) => {
+      state = (state * 1_103_515_245 + 12_345) % 2_147_483_648;
+      return {sequence: index + 1, type: types[Math.floor(state / 65_536) % types.length]};
+    });
+  }
+
+  /** The host's pages of `journal`, `max` events at most, and the requests the host received. */
+  async function readAll(
+    journal: Record<string, unknown>[],
+    max: number,
+    options: {readonly trace: boolean; readonly feature: boolean},
+  ) {
+    const link = new FakeLink();
+    link.helper.host.projects.set('/srv/project', ['mpmc']);
+    link.helper.host.journals.set('/srv/project run-1', journal);
+    if (!options.feature) link.helper.features.delete('run_trace_events');
+    const subject = completionSubject(link);
+    await using _manager = subject.manager;
+    const events: unknown[] = [];
+    for (let from = 1, pages = 0; pages <= journal.length + 2; pages += 1) {
+      const page = await subject.hosts.readEvents(
+        LOCAL,
+        '/srv/project',
+        'run-1',
+        from,
+        max,
+        options.trace ? 'trace' : undefined,
+      );
+      if (page.kind !== 'page') throw new Error('the host serves no history');
+      events.push(...page.events);
+      if (page.complete) break;
+      expect(page.next).toBeGreaterThan(from);
+      from = page.next;
+    }
+    const asked = link.helper.requests.filter(request => request.type === 'runs.read_events');
+    return {events, asked};
+  }
+
+  test('asks a helper with run_trace_events to select them, and sends only those', async () => {
+    const journal = journalOf(3, 60);
+    const {events, asked} = await readAll(journal, 7, {trace: true, feature: true});
+    expect(events).toEqual(journal.filter(event => TRACE.includes(String(event['type']))));
+    expect(asked.every(request => 'kinds' in request && request.kinds === 'trace')).toBe(true);
+  });
+
+  test('selects them itself from an older helper, which is sent no kinds', async () => {
+    const journal = journalOf(3, 60);
+    const {events, asked} = await readAll(journal, 7, {trace: true, feature: false});
+    expect(events).toEqual(journal.filter(event => TRACE.includes(String(event['type']))));
+    expect(asked.some(request => 'kinds' in request)).toBe(false);
+  });
+
+  test('reads the same events from either helper, in fewer requests from the one that selects', async () => {
+    for (const seed of [1, 2, 3, 5, 8, 13, 21, 34]) {
+      const journal = journalOf(seed, 20 + seed * 9);
+      for (const max of [1, 4, 25, 2000]) {
+        const selecting = await readAll(journal, max, {trace: true, feature: true});
+        const older = await readAll(journal, max, {trace: true, feature: false});
+        expect(selecting.events).toEqual(older.events);
+        expect(selecting.asked.length).toBeLessThanOrEqual(older.asked.length);
+      }
+    }
+  });
+
+  test('a read of every event sends no kinds whatever the helper offers', async () => {
+    const journal = journalOf(9, 30);
+    const {events, asked} = await readAll(journal, 10, {trace: false, feature: true});
+    expect(events).toEqual(journal);
+    expect(asked.some(request => 'kinds' in request)).toBe(false);
+  });
+});
+
 describe('Hosts.readSpan', () => {
   test('does not send a span request to a helper without run_span_events', async () => {
     const link = new FakeLink();
@@ -549,6 +803,7 @@ describe('Hosts.readSummary', () => {
     harness: 'codex',
     model: null,
     reasoning_effort: null,
+    client: null,
     harness_version: null,
     started_at: null,
     ended_at: null,

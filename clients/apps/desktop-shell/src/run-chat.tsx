@@ -8,7 +8,7 @@ import {RunScreen, type useRunPage} from '@vibesys/feature-run-page/renderer';
 import {ideaOfAttempt, runHasEnded} from '@vibesys/feature-run-page/state';
 import {settled, type WelcomeBridge} from '@vibesys/ipc';
 import type {RunRef} from '@vibesys/runs';
-import {type JSX, useEffect, useMemo, useState} from 'react';
+import {type JSX, type ReactNode, useEffect, useMemo, useState} from 'react';
 
 type RunPageView = NonNullable<ReturnType<typeof useRunPage>>;
 
@@ -65,6 +65,7 @@ export function RunWithChat(props: {
   readonly page: RunPageView;
   readonly run: RunRef;
   readonly bridge: WelcomeBridge;
+  readonly toolbar?: ReactNode;
 }): JSX.Element {
   const {page, run, bridge} = props;
   const ports = useMemo(() => chatPorts(page.chat, bridge, run), [page.chat, bridge, run]);
@@ -103,6 +104,7 @@ export function RunWithChat(props: {
         panel: chat.panel === null ? null : <ChatPanel {...chat.panel} />,
         ...(unsupported ? {unavailable: NEEDS_UPDATE} : {}),
       }}
+      toolbar={props.toolbar}
     />
   );
 }

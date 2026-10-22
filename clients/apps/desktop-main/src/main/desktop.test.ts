@@ -1,5 +1,11 @@
 import {describe, expect, test} from 'bun:test';
-import {WELCOME_CHANNELS, type WelcomeEvent, type WelcomeResult} from '@vibesys/ipc';
+import {hostKey} from '@vibesys/hosts';
+import {
+  WELCOME_CHANNELS,
+  WELCOME_EVENTS,
+  type WelcomeEvent,
+  type WelcomeResult,
+} from '@vibesys/ipc';
 import {RunHistoryStore} from '@vibesys/run-history';
 import {FakeHistorySource} from '@vibesys/run-history/testing';
 import type {SkippedRecent} from '@vibesys/runs';
@@ -184,7 +190,6 @@ function desktopWorld(cleanups: RetirementCleanups = {}, skipped: SkippedRecent[
       bound = null;
     },
     resume: async () => undefined,
-    stop: async () => undefined,
   };
   const hosts: DesktopDeps['hosts'] = {
     setCheckout: async (_id, path, change) => {
@@ -233,7 +238,14 @@ function desktopWorld(cleanups: RetirementCleanups = {}, skipped: SkippedRecent[
     tasks: async () => [],
   };
   const recent: RecentFile = {version: 4, runs: []};
+  const hostSettingsListeners = new Set<Parameters<DesktopDeps['settings']['onHostsChanged']>[0]>();
   const settings: DesktopDeps['settings'] = {
+    onHostsChanged: listener => {
+      hostSettingsListeners.add(listener);
+      return () => {
+        hostSettingsListeners.delete(listener);
+      };
+    },
     onRecentChanged: () => () => undefined,
     recentSnapshot: async () => ({recent, skipped}),
   };
@@ -242,9 +254,17 @@ function desktopWorld(cleanups: RetirementCleanups = {}, skipped: SkippedRecent[
     focus: () => events.push('main:focus'),
     openSettings: () => events.push('main:settings'),
     releaseSurfaceRun: () => undefined,
-    sendWelcome: <T>(_channel: string, _event: WelcomeEvent<T>): void => undefined,
+    sendWelcome: <T>(channel: string, _event: WelcomeEvent<T>): void => {
+      events.push(`main:push:${channel}`);
+    },
   };
+  const gatewaySettings = new Map<string, boolean>();
   const desktop = new Desktop({
+    gatewaySetting: async (host, enabled) => {
+      const key = hostKey(host);
+      if (enabled !== undefined) gatewaySettings.set(key, enabled);
+      return gatewaySettings.get(key) ?? false;
+    },
     window,
     welcome: new WelcomeFeed(),
     hosts,
@@ -285,6 +305,9 @@ function desktopWorld(cleanups: RetirementCleanups = {}, skipped: SkippedRecent[
     log: message => logs.push(message),
   });
   return {
+    hostSettingsChanged: () => {
+      for (const listener of hostSettingsListeners) listener({version: 2, hosts: {}});
+    },
     configuredReads: () => configuredReads,
     opened,
     historySource,
@@ -404,6 +427,44 @@ describe('Desktop history reads', () => {
     const second = await w.ipc.invokeAs(20, runWindowUrl, '30:300', ...read(1));
     expect(second).toEqual(first);
     expect(w.historySource.requests).toHaveLength(asked);
+  });
+});
+
+describe('Desktop trace reads', () => {
+  test('ask the host for the trace events only, and keep them apart from a read of every event', async () => {
+    const w = desktopWorld();
+    const run = {host: 'ssh:host-b', runId: '20261015-163047'};
+    const key = {host: run.host, project: '/p', runId: run.runId};
+    w.historySource.setJournal(
+      key,
+      Array.from({length: 6}, (_, index) => ({sequence: index + 1})),
+    );
+    w.historySource.setKind('trace', event => event.sequence % 2 === 0);
+
+    const trace = await w.ipc.invoke(
+      '10:100',
+      WELCOME_CHANNELS.readTrace,
+      run.host,
+      '/p',
+      run.runId,
+      1,
+      10,
+    );
+    const whole = await w.ipc.invoke(
+      '10:100',
+      WELCOME_CHANNELS.readEvents,
+      run.host,
+      '/p',
+      run.runId,
+      1,
+      10,
+    );
+
+    expect(trace).toMatchObject({ok: true, value: {kind: 'page', complete: true}});
+    expect(JSON.stringify(trace)).toContain('"sequence":4');
+    expect(JSON.stringify(trace)).not.toContain('"sequence":3');
+    expect(JSON.stringify(whole)).toContain('"sequence":3');
+    expect(w.historySource.requests.map(request => request.kinds)).toEqual(['trace', undefined]);
   });
 });
 
@@ -694,4 +755,17 @@ describe('Desktop checkout ownership', () => {
       'could not retire checkout changes: checkout cancellation: Error: checkout cancellation failed; host retirement: Error: host retirement failed',
     ]);
   });
+});
+
+test('host settings invalidate the main window and every open run window', async () => {
+  const w = desktopWorld();
+  for (const runId of ['run-a', 'run-b'])
+    await w.ipc.invoke('10:100', WELCOME_CHANNELS.openRunWindow, {host: 'local', runId});
+  w.hostSettingsChanged();
+  expect(w.events).toContain(`main:push:${WELCOME_EVENTS.hostSettings}`);
+  expect(w.runWindowList.map(window => window.sent)).toEqual([
+    [WELCOME_EVENTS.hostSettings],
+    [WELCOME_EVENTS.hostSettings],
+  ]);
+  for (const window of w.runWindowList) window.close();
 });

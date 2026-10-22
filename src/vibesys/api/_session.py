@@ -15,7 +15,13 @@ from vibesys.composition import resolve_agent_specs
 from vibesys.events import CoreEventType, EventStatus, RunFailedData, RunStartedData
 from vibesys.orchestration.agent_options import attribution_command_of, objective_axes_of
 from vibesys.plugin_catalog import project_run
-from vibesys.run.core_run import OperatorStopped, RunEnd, drive_core_run, ensure_resumable
+from vibesys.run.core_run import (
+    OperatorPaused,
+    OperatorStopped,
+    RunEnd,
+    drive_core_run,
+    ensure_resumable,
+)
 from vibesys.run.host import open_product_core_host
 from vibesys.run.integration import AuxiliaryResources, LocalRunIntegration, RunResources
 from vibesys.run.overview import overview_of
@@ -170,6 +176,7 @@ class _LocalRunSession:
             system=implementations.system,
         )
         self._control = self._integration.run_control
+        self._integration.events.checkout = implementations.checkout
         self._integration.add_committed_state_listener(self._handle_committed_state)
         self._integration.add_resource_listener(self._handle_resources)
         self._committed_view_listener: Callable[[RunView, tuple[str, ...] | None], None] | None = (
@@ -218,6 +225,22 @@ class _LocalRunSession:
             self._ready_listener(
                 run_ready(resources.auxiliary(), self._registry, self._implementations)
             )
+
+        request = self._request
+        project_max_rounds = self._registration.project_max_rounds
+        self._integration.events.emit(
+            CoreEventType.RUN_STARTED,
+            status=EventStatus.ACTIVE,
+            data=RunStartedData(
+                outer_loop=request.orchestration.id,
+                input=str(request.input_bundle.root),
+                max_rounds=project_max_rounds(self._plugin_options)
+                if project_max_rounds is not None
+                else None,
+                expected_roles=tuple(role.id for role in self._registration.plugin.agents),
+                overview=overview_of(request.input_bundle, objective_axes_of(self._plugin_options)),
+            ),
+        )
 
     def _run_id(self) -> str:
         """Use the provisioned ID once a custom runtime has created its run."""
@@ -294,20 +317,7 @@ class _LocalRunSession:
         request = self._request
         plugin = self._registration.plugin
         options = self._plugin_options
-        project_max_rounds = self._registration.project_max_rounds
-        max_rounds = project_max_rounds(options) if project_max_rounds is not None else None
         try:
-            self._integration.events.emit(
-                CoreEventType.RUN_STARTED,
-                status=EventStatus.ACTIVE,
-                data=RunStartedData(
-                    outer_loop=request.orchestration.id,
-                    input=str(request.input_bundle.root),
-                    max_rounds=max_rounds,
-                    expected_roles=tuple(role.id for role in plugin.agents),
-                    overview=overview_of(request.input_bundle, objective_axes_of(options)),
-                ),
-            )
             outcome = await run_plugin(
                 request,
                 self._integration,
@@ -327,6 +337,15 @@ class _LocalRunSession:
                 invocation_store_factory=self._implementations.invocation_store_factory,
             )
             succeeded = outcome.status.value == "succeeded"
+        except OperatorPaused:
+            self._status = RunStatus.PARKED
+            self._integration.events.emit(CoreEventType.PARKED, "Run paused")
+            return RunResult(
+                run_id=self._run_id(),
+                loop=request.orchestration.id,
+                succeeded=False,
+                status=RunStatus.PARKED,
+            )
         except RunStopped as stop:
             self._status = RunStatus.STOPPED
             self._integration.events.emit(
@@ -342,11 +361,14 @@ class _LocalRunSession:
             )
         except BaseException as exc:
             self._status = RunStatus.FAILED
-            self._integration.events.emit(
-                CoreEventType.RUN_FAILED,
-                f"{type(exc).__name__}: {exc}",
-                status=EventStatus.FAILED,
+            reason = f"{type(exc).__name__}: {exc}"
+            startup_recorded = self._resources is None and self._integration.events.fail_open_epoch(
+                reason
             )
+            if not startup_recorded:
+                self._integration.events.emit(
+                    CoreEventType.RUN_FAILED, reason, status=EventStatus.FAILED
+                )
             raise
         else:
             self._status = RunStatus.COMPLETED if succeeded else RunStatus.FAILED
@@ -486,6 +508,7 @@ def run_ready(
     )
     return RunReady(
         record=store.get_record(resources.run_id),
+        project_root=resources.project.root,
         log_directory=resources.environment_request.log_dir,
         frontend_state_directory=resources.project.state.local_namespace(
             resources.run_id, "server"

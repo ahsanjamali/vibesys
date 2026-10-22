@@ -20,6 +20,7 @@ from vs_agent.api import (
     AgentClient,
     AgentExecutionPolicy,
     AgentSessionSpec,
+    AgentTurnExecutor,
     AgentTurnRequest,
 )
 from vs_agent.api.testing import (
@@ -49,6 +50,7 @@ from vs_core.api import (
     SessionSpec,
     SnapshotAndRetainRun,
     TurnObserved,
+    TurnPermit,
     TurnSpec,
     Until,
     WorkspaceRef,
@@ -228,6 +230,10 @@ class FakeSessionResolver:
             policy=AgentExecutionPolicy(require_enforcement=False),
         )
 
+    def hold_permit(self, execution_id: str, scope: Scope, permit: TurnPermit) -> None:
+        """This resolver has no control channel, so the permit is not a gate here."""
+        del execution_id, scope, permit
+
     def turn_timeout(self, role: RoleId) -> timedelta | None:
         """The one declared in-turn timeout of every role."""
         del role
@@ -294,7 +300,7 @@ class SessionHost:
     """The durable pieces that survive a host restart."""
 
     resolver: FakeSessionResolver
-    client: AgentClient
+    client: AgentTurnExecutor
     journal: FakeAgentInvocationStore
     turns: list[AgentTurnRequest]
     faults: ProviderFaults

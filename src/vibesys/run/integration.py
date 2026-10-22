@@ -36,7 +36,7 @@ from vibesys.events import (
 from vibesys.run.agent_events import CoreAgentEventSink
 from vibesys.run.environment_failure import RunEnvironmentFailure
 from vibesys.run.event_journal import EventJournal
-from vs_core.api import FlowDriver, FlowState, RunTrace, SpanChange, span_changes
+from vs_core.api import CheckoutStatus, FlowDriver, FlowState, RunTrace, SpanChange, span_changes
 from vs_project.api import git_repositories
 from vs_redaction.api import redact_diagnostic_tail
 from vs_runtime.api.core import RuntimeRecord, new_comparisons, new_runaways, winner_selection
@@ -74,7 +74,7 @@ if TYPE_CHECKING:
         RunEnvironmentSession,
     )
     from vs_sandbox.api import HostResource
-    from vs_sim.api import Clock, Threads
+    from vs_sim.api import Clock, SleepingClock, Threads
 
 
 def run_log_emitter(events: AgentEventSink) -> Callable[[str, TextIO], None]:
@@ -545,6 +545,36 @@ def _baseline_drift_detail(event: RootBaselineDrifted) -> str:
     return "; ".join(parts)
 
 
+def _emit_adoption_status(
+    events: AgentEventSink,
+    previous: BaseModel | None,
+    current: RuntimeRecord,
+) -> None:
+    """Project a confirmed publication to the diagnostic stream shared by app and CLI."""
+    adoption = current.envelope.core.settlement.adoption
+    before = (
+        previous.envelope.core.settlement.adoption if isinstance(previous, RuntimeRecord) else None
+    )
+    if (
+        adoption is None
+        or not adoption.verified
+        or adoption.publication is None
+        or adoption == before
+    ):
+        return
+    publication = adoption.publication
+    text = f"[result] published {publication.commit[:12]} on {publication.branch}"
+    if adoption.checkout is not None:
+        status = adoption.checkout.status
+        checkout = (
+            "updated"
+            if status is CheckoutStatus.FAST_FORWARDED
+            else f"skipped: {status.value.replace('_', ' ')}"
+        )
+        text += f"; checkout {checkout}"
+    events.agent_output(text + "\n", channel="diagnostic")
+
+
 class _CoreCommitObserver:
     """Publish a confirmed core commit: the committed-view hint, then its semantic events."""
 
@@ -593,6 +623,7 @@ class _CoreCommitObserver:
             winner_selection(current) if isinstance(current, RuntimeRecord) else None,
         )
         if isinstance(current, RuntimeRecord):
+            _emit_adoption_status(self._integration.agent_events, previous, current)
             _emit_comparisons(
                 self._integration.events,
                 new_comparisons(previous if isinstance(previous, RuntimeRecord) else None, current),
@@ -670,7 +701,7 @@ class LocalRunIntegration:
         git_repository: GitRepositoryFactory | None = None,
         state_stores: StateStoreFactory | None = None,
         *,
-        clock: Clock,
+        clock: SleepingClock,
         git: Git,
         github: GitHubCLI,
         threads: Threads,
@@ -714,13 +745,16 @@ class LocalRunIntegration:
         run_id: str | None = None,
     ) -> None:
         """Attach event persistence to the run's log directory."""
-        del project
-        self.events.attach(log_dir, run_id or log_dir.parent.name)
+        identity = run_id or log_dir.parent.name
+        if project is not None:
+            self.events.enable_runlog(project, identity)
+        self.events.attach(log_dir, identity)
 
     def close(self) -> None:
         """Release integration-owned resources."""
         if self._closed:
             return
+        self.events.close()
         self._closed = True
 
     def agent_execution_event(self, event: AgentExecutionLifecycleEvent) -> CoreEvent:
@@ -745,6 +779,7 @@ class LocalRunIntegration:
                     provider=event.provider,
                     model=event.model,
                     reasoning_effort=event.reasoning_effort,
+                    client=event.client,
                 ),
                 **fields,
             )

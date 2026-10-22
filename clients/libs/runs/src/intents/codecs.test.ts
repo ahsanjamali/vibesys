@@ -1,0 +1,138 @@
+import {expect, test} from 'bun:test';
+import {create, fromBinary, toBinary} from '@bufbuild/protobuf';
+import {
+  HostCallRequestSchema,
+  HostCallResponseSchema,
+  IntentAction,
+  IntentStep,
+  RecordSchema,
+  SteerMode,
+  SteerTargetKind,
+  TailResponseSchema,
+} from '@vibesys/proto';
+import {
+  configuredHostCall,
+  hostIntentRequest,
+  hostIntentResponse,
+  IntentRefused,
+  intentTailResponse,
+  runIntent,
+  runReference,
+} from '@vibesys/runs/intents';
+
+const identity = {runId: 'run-1', requestId: 'r-1', projectRoot: '/project', expectedEpoch: 1n};
+
+test('all visible controls use typed defaults and preserve identity through the pipes', () => {
+  for (const action of ['pause', 'pauseNow', 'steer'] as const) {
+    const request = runIntent(
+      {...identity, ...runReference(identity.projectRoot, identity.runId)},
+      action,
+      'guidance',
+    );
+    const envelope = fromBinary(
+      HostCallRequestSchema,
+      configuredHostCall(hostIntentRequest(request), '/src/vibesys'),
+    );
+    expect(envelope.checkout).toBe('/src/vibesys');
+    expect(envelope.method.case).toBe('postIntent');
+    if (envelope.method.case !== 'postIntent') throw new Error('wrong method');
+    expect(envelope.method.value).toEqual(request);
+    expect(request.intent.case).toBe(action);
+    if (request.intent.case === 'steer') {
+      expect(request.intent.value.mode).toBe(SteerMode.NEXT_TURN);
+      expect(request.intent.value.target?.kind).toBe(SteerTargetKind.RUN);
+      expect(request.intent.value.text).toBe('guidance');
+    }
+  }
+});
+
+test('admission replies must match the request id', () => {
+  const bytes = toBinary(
+    HostCallResponseSchema,
+    create(HostCallResponseSchema, {
+      result: {case: 'postIntent', value: {requestId: 'r-1', orderedReader: true}},
+    }),
+  );
+  expect(hostIntentResponse(bytes, 'r-1').orderedReader).toBe(true);
+  expect(() => hostIntentResponse(bytes, 'r-2')).toThrow('invalid admission reply');
+  expect(() => hostIntentResponse(new Uint8Array(), 'r-1')).toThrow();
+});
+
+test('only IntentState records are outcomes, with refusal reasons preserved', () => {
+  const record = create(RecordSchema, {
+    seq: 1n,
+    body: {
+      case: 'intent',
+      value: {
+        controlId: 'r-1',
+        action: IntentAction.STEER,
+        step: IntentStep.REFUSED,
+        reason: 'role ended',
+      },
+    },
+  });
+  const ignored = create(RecordSchema, {seq: 2n});
+  const result = intentTailResponse(
+    toBinary(
+      TailResponseSchema,
+      create(TailResponseSchema, {
+        records: [toBinary(RecordSchema, record), toBinary(RecordSchema, ignored)],
+      }),
+    ),
+  );
+  expect(result).toHaveLength(1);
+  expect(result[0]?.reason).toBe('role ended');
+});
+
+test('typed HostCall refusals remain distinct from malformed or unconfirmed replies', () => {
+  for (const code of ['invalid_input', 'inbox_closed', 'request_too_large', 'invalid_method']) {
+    for (const stderr of ['', 'details']) {
+      const bytes = toBinary(
+        HostCallResponseSchema,
+        create(HostCallResponseSchema, {
+          result: {
+            case: 'configurationFailed',
+            value: {
+              code,
+              stage: 'post_intent',
+              message: 'Request refused',
+              stderr,
+              exitCode: 2,
+            },
+          },
+        }),
+      );
+      expect(() => hostIntentResponse(bytes, 'r-1')).toThrow(IntentRefused);
+    }
+  }
+});
+
+test('a host process loss or deadline remains unconfirmed rather than refused', () => {
+  for (const code of ['admission_unconfirmed', 'host_command_failed', 'invalid_host_response']) {
+    const bytes = toBinary(
+      HostCallResponseSchema,
+      create(HostCallResponseSchema, {
+        result: {case: 'configurationFailed', value: {code, message: 'Connection lost'}},
+      }),
+    );
+    let failure: unknown;
+    try {
+      hostIntentResponse(bytes, 'r-1');
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(IntentRefused);
+    expect(String(failure)).toContain('same request id');
+  }
+});
+
+test('a control reference requires both its project path and run identity', () => {
+  for (const project of ['', ' ', '\n'])
+    expect(() => runReference(project, 'run-1')).toThrow('projectRoot');
+  expect(() => runReference('/project', '')).toThrow('runId');
+  expect(runReference('/project', 'run-1')).toMatchObject({
+    projectRoot: '/project',
+    runId: 'run-1',
+  });
+});

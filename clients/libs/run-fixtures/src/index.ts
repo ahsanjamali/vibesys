@@ -11,6 +11,7 @@ export {
   FIXTURE_NAMES,
   fixtureNamed,
 } from './catalog.js';
+export {chatReplay} from './chat.js';
 export {
   clusterTestPassed,
   clusterTestPassedUntyped,
@@ -32,6 +33,7 @@ export {
   type RunFixture,
   splitLive,
 } from './fixture.js';
+export {INTENT_REPLAYS, type IntentReplay, intentReplay} from './intent-records.js';
 export {
   clusterTestsByAlias,
   loginStartsByProvider,
@@ -49,4 +51,5 @@ export {
   scrubText,
   scrubValue,
 } from './scrub.js';
+export {type StoreRunFixture, storeRunFixture} from './store-records.js';
 export {weeksRun} from './weeks.js';

@@ -26,6 +26,86 @@ _GIT = Git(OsProcesses())
 # Each export is reviewed as deterministic value construction or transformation.
 # Approving a module does not approve future exports or its imported dependencies.
 PURE_EXPORTS = {
+    # Reflection, immutable schema options and validation operate only on in-memory values.
+    "copy": frozenset({"deepcopy"}),
+    "vs_proto.api.replay": frozenset(
+        {
+            "OperationKey",
+            "KeyComponent",
+            "ReplayFieldKind",
+            "ReplayPolicyDrift",
+            "ReplayResources",
+            "ext_replay_field",
+            "ext_replay_set",
+            "ext_replay_context",
+        }
+    ),
+    **{
+        f"vs_proto.api.replay.{name}": frozenset({"from_binary", "desc"})
+        for name in (
+            "OperationReplay",
+            "ReplayAllowance",
+            "ReplayPolicy",
+            "ReplayNotice",
+            "ReplayAcknowledgement",
+            "ReplayPolicyDrift",
+        )
+    },
+    "vs_proto.api.replay.KeyComponentKind": frozenset(
+        {"PARENT", "ITEM", "SAMPLE", "REVISION", "RECORDED_POSITION"}
+    ),
+    "vs_proto.api.replay.ReplayFieldKind": frozenset({"IDENTITY", "POLICY"}),
+    "protobuf": frozenset(
+        {
+            "Message",
+            "DescMessage",
+            "DescEnum",
+            "DescFieldValue",
+            "DescFieldValueEnum",
+            "Oneof",
+            "DescFieldValueList",
+            "DescFieldValueMap",
+            "DescFieldValueMessage",
+        }
+    ),
+    "protobuf.wkt.google.protobuf.descriptor_pb": frozenset(
+        {"DescriptorProto", "FileDescriptorProto", "FileDescriptorSet"}
+    ),
+    "protobuf.wkt.google.protobuf.descriptor_pb.FileDescriptorProto": frozenset({"from_binary"}),
+    "protobuf.wkt.google.protobuf.any_pb": frozenset({"Any"}),
+    "protovalidate": frozenset({"validate"}),
+    "vs_proto.api": frozenset(
+        {
+            "replay",
+            "core_iterations",
+            "Record",
+            "Change",
+            "EpochStarted",
+            "RUN_LOG_MAX_RECORD_BYTES",
+            "ReplayStore",
+            "Span",
+            "SpanStatus",
+            "validate",
+        }
+    ),
+    **{
+        f"vs_proto.api.{name}": frozenset({"from_binary"})
+        for name in ("EpochStarted", "ReplayStore", "Span")
+    },
+    "vs_proto.api.Change": frozenset({"STARTED", "UPDATED", "ENDED"}),
+    "vs_proto.api.SpanStatus": frozenset({"STOPPED"}),
+    "vs_proto.api.core_iterations": frozenset(
+        {"IterationRequest", "IterationGranted", "IterationCompletion", "IterationCompleted"}
+    ),
+    **{
+        f"vs_proto.api.core_iterations.{name}": frozenset({"from_binary", "desc"})
+        for name in (
+            "IterationRequest",
+            "IterationGranted",
+            "IterationCompletion",
+            "IterationCompleted",
+        )
+    },
     # Decoding bytes already in memory is a pure function of them; ``read_json`` reads a file
     # and stays out of this list.
     "vs_decode.api": frozenset(
@@ -119,7 +199,7 @@ PURE_EXPORTS = {
     # Scope managers that only run the code they wrap; they open nothing themselves.
     "contextlib": frozenset({"asynccontextmanager", "contextmanager", "suppress"}),
     "dataclasses": frozenset(
-        {"asdict", "astuple", "dataclass", "field", "fields", "is_dataclass", "replace"}
+        {"asdict", "astuple", "dataclass", "Field", "field", "fields", "is_dataclass", "replace"}
     ),
     "enum": frozenset({"Enum", "IntEnum", "IntFlag", "Flag", "StrEnum", "auto", "unique"}),
     "functools": frozenset(
@@ -275,6 +355,7 @@ PURE_EXPORTS = {
             "Field",
             "FiniteFloat",
             "InstanceOf",
+            "GetCoreSchemaHandler",
             "Json",
             "JsonValue",
             "NonNegativeFloat",
@@ -300,7 +381,9 @@ PURE_EXPORTS = {
             "model_validator",
         }
     ),
-    "pydantic.dataclasses": frozenset({"dataclass"}),
+    "pydantic.fields": frozenset({"FieldInfo"}),
+    # Class introspection and forward-schema compilation are deterministic and perform no I/O.
+    "pydantic.dataclasses": frozenset({"dataclass", "is_pydantic_dataclass", "rebuild_dataclass"}),
     "pydantic.json_schema": frozenset({"GenerateJsonSchema", "JsonSchemaValue"}),
     "re": frozenset(
         {
@@ -357,6 +440,7 @@ PURE_EXPORTS = {
             "Union",
             "Unpack",
             "assert_never",
+            "final",
             "cast",
             "get_args",
             "get_origin",
@@ -365,7 +449,7 @@ PURE_EXPORTS = {
             "runtime_checkable",
         }
     ),
-    "types": frozenset({"MappingProxyType", "NoneType", "UnionType"}),
+    "types": frozenset({"GenericAlias", "MappingProxyType", "NoneType", "UnionType"}),
     "unicodedata": frozenset(
         {
             "category",
@@ -404,6 +488,7 @@ PURE_BUILTINS = frozenset(
         "RuntimeError",
         "StopIteration",
         "TypeError",
+        "UnicodeDecodeError",
         "ValueError",
         "ZeroDivisionError",
         "abs",

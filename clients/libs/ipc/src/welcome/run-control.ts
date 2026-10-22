@@ -21,9 +21,9 @@ export const RUN_CONTROL_CHANNELS = {
   attach: 'vibesys:welcome:attach',
   attachReader: 'vibesys:welcome:attach-reader',
   resume: 'vibesys:welcome:resume',
-  stopConfirmed: 'vibesys:welcome:stop-confirmed',
   releaseRun: 'vibesys:welcome:release-run',
   readEvents: 'vibesys:welcome:read-events',
+  readTrace: 'vibesys:welcome:read-trace',
   readSummary: 'vibesys:welcome:read-summary',
   readSpan: 'vibesys:welcome:read-span',
   runDigests: 'vibesys:welcome:run-digests',
@@ -171,8 +171,6 @@ export interface RunControlWelcomeBridge {
     runId: string,
   ): Promise<WelcomeResult<ReaderAttached>>;
   resume(host: HostKey, project: string, run: ResumeRunId): Promise<WelcomeResult<null>>;
-  /** Stop a run: the view already asked the user, who said yes. */
-  stopConfirmed(host: HostKey, instance: string, force: boolean): Promise<WelcomeResult<null>>;
   /**
    * Open one connection to the run the window attached for this view (`attach` binds it), over
    * the same relay a run page uses; the port arrives as a `RUN_PORT_MESSAGE` window message named
@@ -185,6 +183,19 @@ export interface RunControlWelcomeBridge {
   releaseRun(): Promise<WelcomeResult<null>>;
   /** One page of run `runId`'s recorded events in `project` on `host`, from `fromSequence`. */
   readEvents(
+    host: HostKey,
+    project: string,
+    runId: string,
+    fromSequence: number,
+    max: number,
+  ): Promise<WelcomeResult<RunHistoryPage>>;
+  /**
+   * One page of run `runId`'s recorded events as `readEvents` reads it, with only the events the
+   * run trace folds (its spans, its declaration and its gates) kept: all the Run screen needs to
+   * place an ended run's scrubber, and a small part of a journal. The page's `next` and `complete`
+   * are the host's whatever it kept, and a page may hold few events or none and not be complete.
+   */
+  readTrace(
     host: HostKey,
     project: string,
     runId: string,
@@ -245,15 +256,17 @@ export type RunControlRequest =
       /** The exact run to resume. */
       readonly run: ResumeRunId;
     }
-  | {
-      readonly kind: 'stop';
-      readonly host: HostId;
-      readonly instance: string;
-      readonly force: boolean;
-    }
   | {readonly kind: 'release-run'}
   | {
       readonly kind: 'read-events';
+      readonly host: HostId;
+      readonly project: string;
+      readonly runId: string;
+      readonly from: number;
+      readonly max: number;
+    }
+  | {
+      readonly kind: 'read-trace';
       readonly host: HostId;
       readonly project: string;
       readonly runId: string;
@@ -290,11 +303,6 @@ export type RunControlRequest =
       readonly since: number;
       readonly until: number;
     };
-
-function forceStop(value: unknown): boolean {
-  if (typeof value !== 'boolean') throw new Error('force stop must be a boolean');
-  return value;
-}
 
 function sequence(value: unknown): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
@@ -361,18 +369,20 @@ export function parseRunControlRequest(
         project: project(second),
         run: exactResumeRunId(third),
       };
-    case RUN_CONTROL_CHANNELS.stopConfirmed:
-      return {
-        kind: 'stop',
-        host: hostFromKey(first),
-        instance: instance(second, 'stop'),
-        force: forceStop(third),
-      };
     case RUN_CONTROL_CHANNELS.releaseRun:
       return {kind: 'release-run'};
     case RUN_CONTROL_CHANNELS.readEvents:
       return {
         kind: 'read-events',
+        host: hostFromKey(first),
+        project: project(second),
+        runId: exactResumeRunId(third),
+        from: sequence(fourth),
+        max: pageSize(fifth),
+      };
+    case RUN_CONTROL_CHANNELS.readTrace:
+      return {
+        kind: 'read-trace',
         host: hostFromKey(first),
         project: project(second),
         runId: exactResumeRunId(third),

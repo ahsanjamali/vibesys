@@ -11,12 +11,16 @@ import {
   HelperRequestError,
   type HostConnection,
   type LogsLease,
+  type RegistrySetup,
+  type RunWatch,
 } from '@vibesys/connection';
-import type {
-  HarnessesListReply,
-  HelperMessage,
-  PathsCompleteReply,
-  UsageRecord,
+import {
+  type HarnessesListReply,
+  type HelperMessage,
+  type PathsCompleteReply,
+  RUN_EVENT_TYPES_BY_KINDS,
+  type RunEventKinds,
+  type UsageRecord,
 } from '@vibesys/contracts/host-helper';
 import {
   digestEntries,
@@ -62,6 +66,19 @@ import {discoverSshConfigAliases, type SshConfigFilesystem} from './ssh-config.j
 /** The most events a helper without `run_history_pages` serves in one `runs.read_events` page. */
 const LEGACY_HISTORY_PAGE_EVENTS = 500;
 
+/** The events of `events` whose `type` `kinds` selects (`RUN_EVENT_TYPES_BY_KINDS`), in their order. */
+function ofKinds(events: readonly unknown[], kinds: RunEventKinds): unknown[] {
+  const types = new Set(RUN_EVENT_TYPES_BY_KINDS[kinds]);
+  return events.filter(
+    event =>
+      typeof event === 'object' &&
+      event !== null &&
+      'type' in event &&
+      typeof event.type === 'string' &&
+      types.has(event.type),
+  );
+}
+
 export interface HostsDeps {
   readonly manager: ConnectionManager;
   /** The settings files' one writer. */
@@ -76,6 +93,14 @@ export interface HostsDeps {
   readonly push: (listing: HostListing) => void;
   /** Forget a host's retained listing when it leaves the desired set. */
   readonly retire: (host: HostKey) => void;
+  /** Per host. Absent or false keeps the helper JSON channel. */
+  readonly transportV2?: (id: HostId) => Promise<boolean>;
+  /** Required when `transportV2` is true. Missing it throws; it does not fall back. */
+  readonly setup?: RegistrySetup;
+  /** Stop a host login when its checkout is replaced or the host is removed. */
+  readonly endLogin?: (id: HostId) => void;
+  /** WatchRuns while this host is shown. Cancel reaps the stream. */
+  readonly runs?: Pick<RunWatch, 'start' | 'cancel'>;
 }
 
 /** How many times a summary is read again when its pages disagree on where the run stood. */
@@ -313,19 +338,23 @@ export class Hosts {
     if (this.#removing.has(host)) throw new Error(`${hostLabel(id)} is being removed`);
     const key = checkoutChangeKey(change);
     if (this.#checkoutChanges.has(key)) throw new Error('the checkout change is already active');
-    const operation = new CheckoutChange(host, this.#deps.manager.candidate(id, checkout));
+    const v2 = await this.#transportV2(id);
+    const operation = new CheckoutChange(
+      host,
+      v2 ? null : this.#deps.manager.candidate(id, checkout),
+    );
     this.#checkoutChanges.set(key, operation);
     try {
-      const candidate = await operation.ready();
-      const root = candidate.checkoutRoot;
-      await operation.closeCandidate();
-      operation.assertCurrent();
+      const root = v2
+        ? await this.#inspectForCheckout(id, checkout, change.sequence, operation)
+        : await this.#inspectWithHelper(operation);
       const outcome = await this.#deps.settings.updateHosts(
-        current => withHostSettings(current, id, {checkout}),
+        current => withHostSettings(current, id, {...settingsFor(current, id), checkout}),
         operation.isCurrent,
       );
       if (outcome === 'cancelled') operation.assertCurrent();
       operation.committed();
+      this.#deps.endLogin?.(id);
       const revision = this.#commitCheckout(hostKey(id), checkout);
       if (this.#desired().has(hostKey(id))) await this.#refresh(id, revision);
       return root ?? checkout;
@@ -373,6 +402,7 @@ export class Hosts {
     const key = hostKey(id);
     if (this.#removing.has(key)) throw new Error(`${hostLabel(id)} is already being removed`);
     this.#removing.add(key);
+    this.#deps.endLogin?.(id);
     try {
       const operations = [...this.#checkoutChanges.values()].filter(
         operation => operation.host === key && operation.cancel(),
@@ -428,6 +458,12 @@ export class Hosts {
   /**
    * One page of run `runId`'s recorded events in `project` on `id` (`runs.read_events`), from
    * `from`; `unsupported` when the host's VibeSys does not serve history (`run_history`).
+   *
+   * With `kinds` the page holds only the events of that kind, whichever helper serves it: a helper
+   * with `run_trace_events` selects them from the journal's index and sends only those; an older
+   * one sends every event of the page and they are selected here. Either way the page's `next` and
+   * `complete` are the helper's, so the pages of a read join to the same events. The totals of a
+   * page that an older helper selects here are the journal's, not the selection's.
    */
   async readEvents(
     id: HostId,
@@ -435,6 +471,7 @@ export class Hosts {
     runId: string,
     from: number,
     max: number,
+    kinds?: RunEventKinds,
   ): Promise<RunHistoryPage> {
     await using lease = await this.connection(id);
     try {
@@ -442,6 +479,7 @@ export class Hosts {
       // the feature, and does not name the journal's totals.
       await lease.connection.ready();
       const pages = lease.connection.features?.includes('run_history_pages') === true;
+      const selects = lease.connection.features?.includes('run_trace_events') === true;
       const reply = await lease.connection.request({
         type: 'runs.read_events',
         project,
@@ -449,10 +487,11 @@ export class Hosts {
         from_sequence: from,
         max: pages ? max : Math.min(max, LEGACY_HISTORY_PAGE_EVENTS),
         ...(pages ? {with_totals: true} : {}),
+        ...(kinds !== undefined && selects ? {kinds} : {}),
       });
       return {
         kind: 'page',
-        events: reply.events,
+        events: kinds !== undefined && !selects ? ofKinds(reply.events, kinds) : reply.events,
         next: reply.next_sequence,
         complete: reply.complete,
         ...(typeof reply.total_events === 'number' ? {totalEvents: reply.total_events} : {}),
@@ -638,6 +677,15 @@ export class Hosts {
 
   /** The directories in `directory` (a path ending in `/`, or `~/`) on `id`. */
   async complete(id: HostId, directory: string): Promise<PathCompletion> {
+    if (await this.#transportV2(id)) {
+      const listed = await this.#setup().completePaths(id, directory, new AbortController().signal);
+      return {
+        kind: 'listed',
+        directory: listed.directory,
+        entries: listed.entries,
+        truncated: listed.truncated,
+      };
+    }
     await using lease = await this.connection(id);
     let reply: PathsCompleteReply;
     try {
@@ -798,6 +846,16 @@ export class Hosts {
     };
   }
 
+  async #startRuns(key: HostKey, stopped: () => boolean): Promise<void> {
+    if ((await this.#deps.transportV2?.(hostFromKey(key))) !== true) return;
+    if (stopped()) return;
+    const runs = this.#deps.runs;
+    if (runs === undefined) {
+      throw new Error('run transport v2 is on and the run watch is missing');
+    }
+    runs.start(hostFromKey(key));
+  }
+
   #install(key: HostKey, checkout: string, lease: ConnectionLease): void {
     const connection = lease.connection;
     // A host returning to the set must overwrite any renderer cache before its old listing could
@@ -813,6 +871,11 @@ export class Hosts {
       });
     }
     const push = this.#deps.push;
+    let stopped = false;
+    void this.#startRuns(key, () => stopped).catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.#deps.log(detail);
+    });
     const stopListing = connection.watchInstances(listing => push(hostListing(key, listing)));
     const stopPhase = connection.onPhase(phase => {
       if (phase.kind !== 'ready') {
@@ -823,8 +886,10 @@ export class Hosts {
       checkout,
       lease,
       stop: () => {
+        stopped = true;
         stopListing();
         stopPhase();
+        this.#deps.runs?.cancel(hostFromKey(key));
       },
     });
   }
@@ -1039,6 +1104,47 @@ export class Hosts {
     }
     return true;
   }
+
+  async #transportV2(id: HostId): Promise<boolean> {
+    return (await this.#deps.transportV2?.(id)) === true;
+  }
+
+  /** The setup port. A missing one is a wiring error, not a reason to use the helper. */
+  #setup(): RegistrySetup {
+    const setup = this.#deps.setup;
+    if (setup === undefined) {
+      throw new Error('run transport v2 is on and the registry setup is missing');
+    }
+    return setup;
+  }
+
+  async #inspectWithHelper(operation: CheckoutChange): Promise<string | null> {
+    const candidate = await operation.ready();
+    const root = candidate.checkoutRoot;
+    await operation.closeCandidate();
+    operation.assertCurrent();
+    return root;
+  }
+
+  async #inspectForCheckout(
+    id: HostId,
+    checkout: string,
+    sequence: number,
+    operation: CheckoutChange,
+  ): Promise<string> {
+    if (sequence <= 0) throw new Error('stale selection');
+    const inspected = await this.#setup().inspectCandidate(
+      id,
+      checkout,
+      BigInt(sequence),
+      operation.signal,
+    );
+    operation.assertCurrent();
+    if (inspected.state === 'not_found') throw new Error('the checkout was not found');
+    if (inspected.state === 'too_old') throw new Error('the checkout is too old');
+    if (!inspected.compatible) throw new Error('the checkout is incompatible');
+    return inspected.root;
+  }
 }
 
 /** One inspector's hold on a host's logs channel: its connection lease, then its logs lease. */
@@ -1128,12 +1234,14 @@ type CheckoutRevision = WatchIntent | {readonly removed: true};
 class CheckoutChange {
   readonly host: HostKey;
   readonly settled: Promise<void>;
-  readonly #candidate: Promise<HostConnection>;
   #resolveSettled: () => void = () => undefined;
   #state: 'current' | 'cancelled' | 'committed' = 'current';
   #closing: Promise<void> | null = null;
 
-  constructor(host: HostKey, candidate: Promise<HostConnection>) {
+  readonly #abort = new AbortController();
+  readonly #candidate: Promise<HostConnection> | null;
+
+  constructor(host: HostKey, candidate: Promise<HostConnection> | null) {
     this.host = host;
     this.#candidate = candidate;
     this.settled = new Promise(resolve => {
@@ -1143,9 +1251,14 @@ class CheckoutChange {
 
   readonly isCurrent = (): boolean => this.#state === 'current';
 
+  get signal(): AbortSignal {
+    return this.#abort.signal;
+  }
+
   cancel(): boolean {
     if (this.#state !== 'current') return false;
     this.#state = 'cancelled';
+    this.#abort.abort();
     return true;
   }
 
@@ -1166,6 +1279,7 @@ class CheckoutChange {
   }
 
   async ready(): Promise<HostConnection> {
+    if (this.#candidate === null) throw new Error('the checkout change has no candidate');
     const candidate = await this.#candidate;
     this.assertCurrent();
     await candidate.ready();
@@ -1174,6 +1288,7 @@ class CheckoutChange {
   }
 
   closeCandidate(): Promise<void> {
+    if (this.#candidate === null) return Promise.resolve();
     // Acquisition itself may reject when the manager is closing. Cleanup must not replace the
     // primary error from `ready`, but a candidate that was built always remains this operation's.
     this.#closing ??= this.#candidate.then(

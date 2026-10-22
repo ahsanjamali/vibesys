@@ -12,7 +12,18 @@ import {
   installAskpass,
   type Link,
   LocalLink,
+  LoginActor,
+  MUTATE_METHOD,
+  READ_METHOD,
+  registryClusters,
+  registryProjects,
+  registryReads,
+  registrySetup,
+  registryStart,
+  runWatch,
   SshLink,
+  WATCH_METHOD,
+  WATCH_RUNS_METHOD,
 } from '@vibesys/connection';
 import {RunNotifier} from '@vibesys/feature-app-shell/main';
 import {Hosts} from '@vibesys/feature-hosts/main';
@@ -20,7 +31,7 @@ import {MachinesMain} from '@vibesys/feature-machines/main';
 import {NewRunMain} from '@vibesys/feature-new-run/main';
 import {type RelayPort, RunControl} from '@vibesys/feature-run-control/main';
 import {PreferencesMain} from '@vibesys/feature-settings/main';
-import {type HostId, hostFromKey} from '@vibesys/hosts';
+import {type HostId, type HostListing, hostFromKey, hostKey} from '@vibesys/hosts';
 import {
   FIRST_PAINT_CHANNEL,
   type FirstPaint,
@@ -28,7 +39,7 @@ import {
   type WelcomeEvent,
 } from '@vibesys/ipc';
 import {RunHistoryStore} from '@vibesys/run-history';
-import {remember, SettingsStore} from '@vibesys/settings';
+import {remember, SettingsStore, settingsFor} from '@vibesys/settings';
 import {app, ipcMain, Menu, Notification, nativeTheme, net, powerMonitor, shell} from 'electron';
 import {SHELL_URL} from './app-assets.js';
 import {AppLaunches} from './app-launches.js';
@@ -42,6 +53,7 @@ import {
 } from './app-security.js';
 import {AppStartup} from './app-startup.js';
 import {Desktop} from './desktop.js';
+import {createGatewayCalls, gatewaySetting, installGatewayIpc} from './gateway-ipc.js';
 import {type LaunchPlan, userDataOverride} from './launch-args.js';
 import {planFromSecondInstance, prepareLaunchHandoff} from './launch-handoff.js';
 import {RunWindows} from './run-windows.js';
@@ -77,11 +89,31 @@ function watchNetwork(manager: ConnectionManager): void {
 }
 
 /** New run's requests, answered over the hosts' connections, recording each start in Recent. */
-function newRunMain(hosts: Hosts, settings: SettingsStore): NewRunMain {
+function newRunMain(
+  hosts: Hosts,
+  settings: SettingsStore,
+  gateway: ReturnType<typeof installGateway>,
+  runs: ReturnType<typeof runWatch>,
+): NewRunMain {
+  const starts = registryStart({
+    checkout: id => hosts.checkout(id),
+    unary: (id, bytes, signal) => gateway.unary(hostKey(id), MUTATE_METHOD, bytes, signal),
+  });
   return new NewRunMain({
     connect: id => hosts.connection(id),
     remember: run => settings.updateRecent(recent => remember(recent, run)),
     now: () => Date.now(),
+    transportV2: async id => {
+      const {settings: file} = await settings.hosts();
+      return settingsFor(file, id)?.runTransportV2 === true;
+    },
+    registryStart: (host, inputs, signal) => starts.start(host, inputs, signal),
+    registryProjects: registryProjects({
+      checkout: id => hosts.checkout(id),
+      read: (id, bytes, signal) => gateway.unary(hostKey(id), READ_METHOD, bytes, signal),
+      mutate: (id, bytes, signal) => gateway.unary(hostKey(id), MUTATE_METHOD, bytes, signal),
+    }),
+    watchRuns: runs,
   });
 }
 
@@ -99,6 +131,45 @@ function installApplicationMenu(main: () => AppWindow): void {
   );
 }
 
+function installFirstPaint(preferences: PreferencesMain): void {
+  ipcMain.on(FIRST_PAINT_CHANNEL, event => {
+    const firstPaint: FirstPaint = {
+      theme: preferences.theme(),
+      chromeInset: chromeInset(process.platform),
+    };
+    event.returnValue = firstPaint;
+  });
+}
+
+function runNotifier(preferences: PreferencesMain, focus: () => void): RunNotifier {
+  return new RunNotifier({
+    enabled: () => preferences.notificationsEnabled(),
+    notify: notice => {
+      const notification = new Notification({title: notice.title, body: notice.body});
+      notification.on('click', () => focus());
+      notification.show();
+    },
+  });
+}
+
+function watchHostRuns(gateway: ReturnType<typeof installGateway>, manager: ConnectionManager) {
+  const runs = runWatch({
+    stream: (host, bytes, signal, receive) =>
+      gateway.stream(hostKey(host), WATCH_RUNS_METHOD, bytes, signal, receive),
+  });
+  manager.onDisposing(() => runs.close());
+  return runs;
+}
+
+function installGateway(manager: ConnectionManager, settings: SettingsStore) {
+  return createGatewayCalls(
+    manager,
+    settings,
+    fileURLToPath(new URL('../gateway/', import.meta.url)),
+    realTimers,
+  );
+}
+
 async function openWindow(
   manager: ConnectionManager,
   fatal: (error: Error) => void,
@@ -113,6 +184,8 @@ async function openWindow(
     preferencesPath: join(userData, 'preferences.json'),
     log,
   });
+  const gateway = installGateway(manager, settings);
+  const watchedRuns = watchHostRuns(gateway, manager);
   const welcome = new WelcomeFeed();
   const preferences = new PreferencesMain({
     store: settings,
@@ -122,53 +195,34 @@ async function openWindow(
   await preferences.load();
   // The preload asks for this before the page's scripts run, so the first paint is in the theme
   // and clear of the window controls.
-  ipcMain.on(FIRST_PAINT_CHANNEL, event => {
-    const firstPaint: FirstPaint = {
-      theme: preferences.theme(),
-      chromeInset: chromeInset(process.platform),
-    };
-    event.returnValue = firstPaint;
-  });
-  const notifier = new RunNotifier({
-    enabled: () => preferences.notificationsEnabled(),
-    notify: notice => {
-      const notification = new Notification({title: notice.title, body: notice.body});
-      notification.on('click', () => windows.main.focus());
-      notification.show();
-    },
-  });
+  installFirstPaint(preferences);
+  const notifier = runNotifier(preferences, () => windows.main.focus());
   // The one copy of every ended run's recorded events, shared by all windows. It reads the host
   // through `hosts` (below), and forgets a run the host lists as live again or a host that goes.
   const history = new RunHistoryStore({
     source: {
-      read: (run, from, max) =>
-        hosts.readEvents(hostFromKey(run.host), run.project, run.runId, from, max),
+      read: (run, from, max, kinds) =>
+        hosts.readEvents(hostFromKey(run.host), run.project, run.runId, from, max, kinds),
     },
   });
-  const hosts = new Hosts({
+  const held: {logins?: LoginActor} = {};
+  const {hosts, setup} = listedHosts({
     manager,
     settings,
-    localCheckout: REPOSITORY_ROOT,
-    sshConfigPath: join(homedir(), '.ssh', 'config'),
-    log,
-    push: listing => {
-      notifier.listing(listing);
-      if (listing.kind === 'listed') {
-        for (const run of listing.live) history.runsLive(listing.host, [run.runId]);
-      }
-      windows.broadcast(WELCOME_EVENTS.listing, welcome.listing(listing));
-    },
-    retire: host => {
-      history.invalidateHost(host);
-      welcome.retireHost(host);
-    },
+    gateway,
+    history,
+    notifier,
+    welcome,
+    broadcast: listing => windows.broadcast(WELCOME_EVENTS.listing, welcome.listing(listing)),
+    endLogin: id => held.logins?.cancelHost(id),
+    runs: watchedRuns,
   });
+  const logins = startLogins(hosts, gateway, manager);
+  held.logins = logins;
   const runs: RunControl = new RunControl({
     connection: id => hosts.connection(id),
     // A run shown in a window of its own is live there; any other run in the main window.
     openPage: runId => (windows.runs.showing(runId) ?? windows.main).bindRun(runId),
-    // Every stop is confirmed by the Run screen that asks, so the app asks no question.
-    confirm: () => Promise.reject(new Error('stops are confirmed by the view that asks')),
     // Nothing shows the window's run state any more.
     changed: () => {},
     remember: (run, current) => settings.updateRecent(recent => remember(recent, run), current),
@@ -181,11 +235,19 @@ async function openWindow(
     welcome,
     hosts,
     history,
-    machines: machinesOver(settings, hosts),
+    machines: machinesOver(settings, hosts, gateway, setup, logins, watchedRuns),
     runs,
     settings,
     preferences,
-    newRun: newRunMain(hosts, settings),
+    newRun: newRunMain(hosts, settings, gateway, watchedRuns),
+    gatewaySetting: gatewaySetting(
+      settings,
+      host => hosts.checkout(host),
+      host => {
+        logins.cancelHost(hostFromKey(host));
+        gateway.disable(host);
+      },
+    ),
     runWindows: windows.runs,
     shellUrl: SHELL_URL,
     openExternal: url => shell.openExternal(url),
@@ -207,6 +269,8 @@ async function openWindow(
   // A machine that slept has dead connections nobody has noticed yet: check them now.
   powerMonitor.on('resume', () => manager.wake());
   watchNetwork(manager);
+  const admits = desktop.admitsRenderer.bind(desktop);
+  installGatewayIpc(ipcMain, {calls: gateway, settings, admits});
   return desktop;
 }
 
@@ -248,13 +312,104 @@ function appWindows(runs: RunControl, fatal: (error: Error) => void) {
   };
 }
 
+function listedHosts(parts: {
+  readonly manager: ConnectionManager;
+  readonly settings: SettingsStore;
+  readonly gateway: ReturnType<typeof installGateway>;
+  readonly history: RunHistoryStore;
+  readonly notifier: RunNotifier;
+  readonly welcome: WelcomeFeed;
+  readonly broadcast: (listing: HostListing) => void;
+  readonly endLogin?: (id: HostId) => void;
+  readonly runs: ReturnType<typeof runWatch>;
+}): {readonly hosts: Hosts; readonly setup: ReturnType<typeof registrySetup>} {
+  const {manager, settings, gateway, history, notifier, welcome, broadcast, endLogin, runs} = parts;
+  const {transportV2, setup} = hostTransport(settings, gateway);
+  return {
+    setup,
+    hosts: new Hosts({
+      manager,
+      settings,
+      localCheckout: REPOSITORY_ROOT,
+      sshConfigPath: join(homedir(), '.ssh', 'config'),
+      transportV2,
+      setup,
+      ...(endLogin === undefined ? {} : {endLogin}),
+      runs,
+      log,
+      push: listing => {
+        notifier.listing(listing);
+        if (listing.kind === 'listed') {
+          for (const run of listing.live) history.runsLive(listing.host, [run.runId]);
+        }
+        broadcast(listing);
+      },
+      retire: host => {
+        history.invalidateHost(host);
+        welcome.retireHost(host);
+      },
+    }),
+  };
+}
+
+/** The per-host switch and the setup reads that do not need a saved checkout. */
+function hostTransport(settings: SettingsStore, gateway: ReturnType<typeof installGateway>) {
+  return {
+    transportV2: async (id: HostId) => {
+      const {settings: file} = await settings.hosts();
+      return settingsFor(file, id)?.runTransportV2 === true;
+    },
+    setup: registrySetup({
+      unary: (id: HostId, bytes: Uint8Array, signal: AbortSignal) =>
+        gateway.unary(hostKey(id), READ_METHOD, bytes, signal),
+    }),
+  };
+}
+
+/** The login actor. It outlives a panel and closes with the connection manager. */
+function startLogins(
+  hosts: Hosts,
+  gateway: ReturnType<typeof installGateway>,
+  manager: ConnectionManager,
+): LoginActor {
+  const logins = new LoginActor({
+    checkout: id => hosts.checkout(id),
+    stream: (id, bytes, signal, receive) =>
+      gateway.stream(hostKey(id), WATCH_METHOD, bytes, signal, receive),
+  });
+  manager.onDisposing(() => logins.close());
+  return logins;
+}
+
 /** The machines, over the settings store and the hosts' checkouts and connections. */
-function machinesOver(settings: SettingsStore, hosts: Hosts): MachinesMain {
+function machinesOver(
+  settings: SettingsStore,
+  hosts: Hosts,
+  gateway: ReturnType<typeof installGateway>,
+  setup: ReturnType<typeof registrySetup>,
+  logins: LoginActor,
+  runs: ReturnType<typeof runWatch>,
+): MachinesMain {
   return new MachinesMain({
     settings,
     removeHost: id => hosts.remove(id),
     checkout: id => hosts.checkout(id),
     connection: id => hosts.connection(id),
+    transportV2: async id => {
+      const {settings: file} = await settings.hosts();
+      return settingsFor(file, id)?.runTransportV2 === true;
+    },
+    registry: registryReads({
+      checkout: id => hosts.checkout(id),
+      unary: (id, bytes, signal) => gateway.unary(hostKey(id), READ_METHOD, bytes, signal),
+    }),
+    clusters: registryClusters({
+      checkout: id => hosts.checkout(id),
+      unary: (id, bytes, signal) => gateway.unary(hostKey(id), MUTATE_METHOD, bytes, signal),
+    }),
+    setup,
+    logins,
+    runs,
   });
 }
 

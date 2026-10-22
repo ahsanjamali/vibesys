@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from vs_agent.api import AgentTurnRequest, ClientAgentSessions, MCPServerSpec
-from vs_core.api import Access, InputMode, Scope
+from vs_core.api import Access, InputMode, Scope, TurnPermit
 from vs_prompts.api import TemplateRenderer
 from vs_runtime._artifact_store import ArtifactStoreError
 from vs_runtime._session_lifecycle_requests import SessionLifecycleRequests
@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from vs_prompts.api import RenderedPrompt
     from vs_runtime._artifact_store import ArtifactStore
     from vs_runtime._receipt_store import ReceiptStore
+    from vs_runtime._run_control import RunControlChannel
     from vs_runtime._session_requests import SessionResolver, TurnYields
     from vs_runtime._workspace_access import AccessGuardedWorkspace
     from vs_runtime._workspace_receipts import WorkspaceReceipts
@@ -84,6 +85,7 @@ class ResolverInputs:
     session_spec: SessionSpecFactory
     artifact_directories: tuple[str, ...] = ()
     """Workspace-relative directories a ``write-artifacts`` turn may write."""
+    control: RunControlChannel | None = None
     tool_servers: ToolServerSource | None = None
     """Agent tool servers bound per role and scope; None offers the role no extra tool."""
     renderer: TemplateRenderer | None = None
@@ -150,18 +152,25 @@ class ProductionSessionResolver:
         role = self._role(turn.session.role_id)
         if role is None:
             return None
+        scope = turn.workspace if isinstance(turn.workspace, Scope) else turn.workspace.scope
+        if self._inputs.control is not None:
+            self._inputs.control.prepare_execution(turn.invocation_id.root, scope)
         spec = self._inputs.session_spec(role, workspace.path)
         if turn.session.model is not None:  # the model the operator chose for this role's search
             spec = replace(spec, model=turn.session.model)
         source = self._inputs.tool_servers
         if source is None:
             return spec
-        scope = turn.workspace if isinstance(turn.workspace, Scope) else turn.workspace.scope
         extra = tuple(
             MCPServerSpec(item.name, item.command, item.args, item.env, item.runtime_env)
             for item in source.servers(role, scope)
         )
         return replace(spec, mcp_servers=(*spec.mcp_servers, *extra))
+
+    def hold_permit(self, execution_id: str, scope: Scope, permit: TurnPermit) -> None:
+        """Record the permit core issued before preparation publishes the execution."""
+        if self._inputs.control is not None:
+            self._inputs.control.prepare_execution(execution_id, scope, permit=permit)
 
     def turn_timeout(self, role: RoleId) -> timedelta | None:
         """The role's resolved in-turn timeout; one constant for every turn of the role."""
