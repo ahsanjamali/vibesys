@@ -75,6 +75,58 @@ def test_replay_proto_values_allow_memory_codecs_but_no_unreviewed_methods(name:
     assert {site.rule for site in forbidden} == {"effect-path"}
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "ReplayPhysical",
+        "WriterBacking",
+        "WriterIdentity",
+        "WriterManifest",
+        "WriterTerminationProof",
+        "WriterReconciliation",
+        "ReplayToolSubmission",
+        "ReplayToolAcknowledgement",
+        "ReplayTurnWait",
+    ],
+)
+def test_writer_proto_codecs_are_pure_but_file_methods_stay_forbidden(name: str) -> None:
+    path = f"{PURE_SCOPE}/flows/example.py"
+    prefix = "from vs_proto.api import replay as pb\n"
+    assert (
+        scan_source(
+            path, prefix + f"value = pb.{name}.from_binary(data)\nschema = pb.{name}.desc()\n"
+        )
+        == ()
+    )
+    assert {
+        site.rule for site in scan_source(path, prefix + f"pb.{name}.read_file('input.pb')\n")
+    } == {"effect-path"}
+
+
+@pytest.mark.parametrize(
+    ("family", "name"),
+    [
+        ("replay_agent", "ReplayAgentRequest"),
+        ("replay_evaluation", "ReplayEvaluationRequest"),
+    ],
+)
+def test_turn_request_codecs_are_pure_but_unreviewed_methods_are_rejected(
+    family: str, name: str
+) -> None:
+    path = f"{PURE_SCOPE}/flows/example.py"
+    prefix = f"from vs_proto.api import {family} as pb\n"
+    assert (
+        scan_source(
+            path, prefix + f"value = pb.{name}.from_binary(data)\nschema = pb.{name}.desc()\n"
+        )
+        == ()
+    )
+    assert {
+        site.rule for site in scan_source(path, prefix + f"pb.{name}.read_file('input.pb')\n")
+    } == {"effect-path"}
+    assert scan_source(path, prefix + "pb.ExecutionService()\n")
+
+
 def test_native_replay_record_validation_is_pure_but_unreviewed_exports_are_rejected() -> None:
     path = f"{PURE_SCOPE}/flows/example.py"
     source = (
@@ -82,6 +134,16 @@ def test_native_replay_record_validation_is_pure_but_unreviewed_exports_are_reje
     )
     assert scan_source(path, source) == ()
     assert scan_source(path, "from vs_proto.api import FileStore\n")
+
+
+def test_only_pure_epoch_exports_are_allowed_in_core() -> None:
+    path = f"{PURE_SCOPE}/flows/example.py"
+    source = (
+        "from vs_runlog.api import CurrentEpoch, epoch_has_ended\n"
+        "closed = epoch_has_ended(CurrentEpoch(1, lifecycle))\n"
+    )
+    assert scan_source(path, source) == ()
+    assert scan_source(path, "from vs_runlog.api import RunLogReader\n")
 
 
 @pytest.mark.parametrize("operation", ["is_pydantic_dataclass", "rebuild_dataclass"])

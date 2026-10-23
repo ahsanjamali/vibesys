@@ -197,11 +197,15 @@ def test_hello_loads_no_engine_and_reports_its_start_up_time(
     assert "vs_project._run_index" not in loaded
     # Publication loads when a run publishes a revision, never for hello.
     assert "vs_project._revision_publication" not in loaded
+    # Retained-file reads serve the fact importer and a semantic restart, never hello.
+    assert "vs_project._retained" not in loaded
     # Transport dependencies load only when a run publishes or reads a log.
     assert {"vs_runlog", "vs_proto", "google_crc32c", "google.protobuf"}.isdisjoint(loaded)
     # The launcher's light commands load on dispatch: hello pays for none of them, so the
     # ``evals`` command's Slurm ledger (about 85 modules) stays out of the helper.
     assert [name for name in loaded if name.split(".")[0] == "vs_slurm"] == []
+    # Saved-run import and paging load only for a saved-run request.
+    assert "server.host_saved_runs" not in loaded
     # The run summary's fold and cache load on the first summary request.
     assert {"server.run_summary", "server.run_summary_cache"}.isdisjoint(loaded)
 

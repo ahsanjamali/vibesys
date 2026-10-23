@@ -61,6 +61,7 @@ export * from './generated/vibesys/store/v1/environment_attrs_pb.js';
 export * from './generated/vibesys/store/v1/epoch_pb.js';
 export * from './generated/vibesys/store/v1/intent_pb.js';
 export * from './generated/vibesys/store/v1/lifecycle_pb.js';
+export * from './generated/vibesys/store/v1/notice_pb.js';
 export {
   type EpochStarted,
   EpochStartedSchema,
@@ -72,8 +73,8 @@ export {
 export * from './generated/vibesys/store/v1/skeleton_pb.js';
 export * from './generated/vibesys/store/v1/span_pb.js';
 export * from './generated/vibesys/store/v1/transcript_pb.js';
+export {HOST_UNSUPPORTED_MESSAGE, OperationFailed} from './operation-failure.js';
 export type {Accepted, OperationSignal, OperationTransport} from './operations.js';
-export {OperationFailed} from './operations.js';
 export {projectMessage} from './project.js';
 export {API_SCHEMA_HASH, HOST_SCHEMA_HASH, STORE_SCHEMA_HASH, schemaHash} from './schema-hashes.js';
 

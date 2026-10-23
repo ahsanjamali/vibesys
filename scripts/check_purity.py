@@ -26,6 +26,8 @@ _GIT = Git(OsProcesses())
 # Each export is reviewed as deterministic value construction or transformation.
 # Approving a module does not approve future exports or its imported dependencies.
 PURE_EXPORTS = {
+    # Immutable epoch facts and the pure lifecycle predicate perform no I/O.
+    "vs_runlog.api": frozenset({"CurrentEpoch", "epoch_has_ended"}),
     # Reflection, immutable schema options and validation operate only on in-memory values.
     "copy": frozenset({"deepcopy"}),
     "vs_proto.api.replay": frozenset(
@@ -35,6 +37,13 @@ PURE_EXPORTS = {
             "ReplayFieldKind",
             "ReplayPolicyDrift",
             "ReplayResources",
+            "AccountingDimension",
+            "AccountingEvidence",
+            "AccountingObservation",
+            "AccountingOccurrence",
+            "AccountingOccurrenceKind",
+            "AccountingQuantity",
+            "AccountingCoverage",
             "ext_replay_field",
             "ext_replay_set",
             "ext_replay_context",
@@ -49,8 +58,40 @@ PURE_EXPORTS = {
             "ReplayNotice",
             "ReplayAcknowledgement",
             "ReplayPolicyDrift",
+            "ReplayPhysical",
+            "WriterBacking",
+            "WriterIdentity",
+            "WriterManifest",
+            "WriterTerminationProof",
+            "WriterReconciliation",
+            "ReplayToolSubmission",
+            "ReplayToolAcknowledgement",
+            "ReplayTurnWait",
+            "ReplayTurnBound",
+            "ReplayTurnPermit",
+            "ReplayControl",
+            "ReplayControlApplied",
+            "ReplayControlDisposition",
+            "ReplaySteer",
+            "AccountingEvidence",
+            "AccountingObservation",
+            "AccountingCoverage",
         )
     },
+    # Operator control dispositions are closed protobuf enums.
+    "vs_proto.api.replay.ReplayControlStale": frozenset({"EPOCH", "TURN"}),
+    "vs_proto.api.replay.AccountingDimension": frozenset(
+        {"MONEY_USD", "INPUT_TOKENS", "CACHE_READ_TOKENS", "CACHE_CREATION_TOKENS", "OUTPUT_TOKENS"}
+    ),
+    "vs_proto.api.replay.AccountingOccurrenceKind": frozenset({"INVOCATION"}),
+    # Exact rational arithmetic over in-memory values.
+    "fractions": frozenset({"Fraction"}),
+    # These generated request codecs only transform retained in-memory values.
+    "vs_proto.api.replay_agent": frozenset({"ReplayAgentRequest"}),
+    "vs_proto.api.replay_agent.ReplayAgentRequest": frozenset({"from_binary", "desc"}),
+    "vs_proto.api.replay_evaluation": frozenset({"ReplayEvaluationRequest"}),
+    "vs_proto.api.replay_evaluation.ReplayEvaluationRequest": frozenset({"from_binary", "desc"}),
+    "protobuf.wkt.google.protobuf.any_pb.Any": frozenset({"from_binary"}),
     "vs_proto.api.replay.KeyComponentKind": frozenset(
         {"PARENT", "ITEM", "SAMPLE", "REVISION", "RECORDED_POSITION"}
     ),
@@ -78,6 +119,8 @@ PURE_EXPORTS = {
         {
             "replay",
             "core_iterations",
+            "replay_agent",
+            "replay_evaluation",
             "Record",
             "Change",
             "EpochStarted",
@@ -90,10 +133,10 @@ PURE_EXPORTS = {
     ),
     **{
         f"vs_proto.api.{name}": frozenset({"from_binary"})
-        for name in ("EpochStarted", "ReplayStore", "Span")
+        for name in ("EpochStarted", "ReplayStore", "Span", "Record")
     },
     "vs_proto.api.Change": frozenset({"STARTED", "UPDATED", "ENDED"}),
-    "vs_proto.api.SpanStatus": frozenset({"STOPPED"}),
+    "vs_proto.api.SpanStatus": frozenset({"STOPPED", "RUNNING", "DONE"}),
     "vs_proto.api.core_iterations": frozenset(
         {"IterationRequest", "IterationGranted", "IterationCompletion", "IterationCompleted"}
     ),

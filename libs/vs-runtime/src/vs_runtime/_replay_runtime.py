@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, assert_never
+from typing import TYPE_CHECKING, Protocol, assert_never, runtime_checkable
 
 from protobuf import Message, Oneof
 from protobuf.wkt.google.protobuf.any_pb import Any
+from protobuf.wkt.google.protobuf.timestamp_pb import Timestamp
 
 from vs_core.api.replay import (
     ENCODING_VERSION,
@@ -20,6 +21,14 @@ from vs_core.api.replay import (
     ReplayResourcesBlocked,
     ReplayScheduler,
     ReplaySettings,
+    ReplayWriterRecovery,
+    SuspensionRefusal,
+    applied_control,
+    classify_control,
+    effective_deadline,
+    physical_start,
+    proof_covers,
+    proof_digest,
     replay_descriptors,
     reply_schema_digest,
 )
@@ -41,22 +50,23 @@ from vs_proto.api import (
     SpanStatus,
     Stop,
     TokenUsage,
+    replay_agent,
     validate,
 )
 from vs_proto.api import (
     ReplayStore as ReplayRecords,
 )
 from vs_proto.api import replay as pb
-from vs_runlog.api import CurrentEpoch, current_epoch
+from vs_runlog.api import CurrentEpoch, current_epoch, epoch_has_ended
 from vs_runtime._replay_store import REPLAY_STORE_SCHEMA_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
 
-    from protobuf.wkt.google.protobuf.timestamp_pb import Timestamp
-
-    from vs_core.api.replay import ReplayFlow, ReplayFrontier
+    from vs_core.api.replay import ReplayFlow, ReplayFrontier, ReplayRootReuse
     from vs_runtime._replay_store import ReplayStore
+    from vs_runtime._writer_reconciliation import WriterRegistry
+    from vs_sim.api import Clock
 
 
 @dataclass(frozen=True)
@@ -92,6 +102,8 @@ class ReplayResult:
     paid: bool = False
     cost_usd: float | None = None
     usage: TokenUsage | None = None
+    turn: pb.ReplayTurnObservation | None = None
+    """A bound turn's bound and accepted yield; the archive checks both against the log."""
 
 
 @dataclass(frozen=True)
@@ -133,6 +145,13 @@ class ReplayExecutor(Protocol):
     ) -> ReplayResult | ReplayAbsent | ReplayPending | ReplayUnknown:
         """Classify the exact durable invocation; Unknown must never be reported as absent."""
         ...
+
+
+@runtime_checkable
+class ReplayRetirement(Protocol):
+    """Settle a withdrawn physical invocation after environment-issued death proof."""
+
+    async def retire(self, span: Span, fence: StoreFence, reuse: ReplayRootReuse) -> None: ...
 
 
 class ReplayRuntime:
@@ -224,7 +243,7 @@ class ReplayRuntime:
         now: float,
         at: Timestamp,
     ) -> None:
-        """Acquire, validate, acknowledge the preceding notice and reconstruct the root."""
+        """Acquire, validate, acknowledge every outstanding notice and reconstruct the root."""
         if self._fence is not None or self._halted:
             problem = "start requires a fresh shell"
             raise ReplayCommitError(problem)
@@ -247,28 +266,10 @@ class ReplayRuntime:
         if acks == self._archive.acknowledgements:
             problem = "Resume launch already recorded; inspect its epoch instead of relaunching"
             raise ReplayCommitError(problem)
-        state = self._epoch.lifecycle
-        closed = (
-            state is not None
-            and state.state is not None
-            and state.state.field in {"ended", "parked"}
-        )
-        if self._epoch.number and not closed:
-            self._append(
-                Oneof(
-                    "lifecycle",
-                    Lifecycle(
-                        state=Oneof(
-                            "ended",
-                            Ended(
-                                outcome=Outcome.INTERRUPTED,
-                                summary="The epoch writer was interrupted. External work is retained for inspection.",
-                                resumable=True,
-                                interruption_reason="writer_restarted",
-                            ),
-                        )
-                    ),
-                ),
+        if self._epoch.number and not epoch_has_ended(self._epoch):
+            self._interrupted(
+                "writer_restarted",
+                "The epoch writer was interrupted. External work is retained for inspection.",
                 now=now,
                 at=at,
             )
@@ -276,9 +277,7 @@ class ReplayRuntime:
         epoch.epoch = self._epoch.number + 1
         epoch.identity_encoding_version = ENCODING_VERSION
         epoch.initial_allowance = pb.ReplayAllowance.from_binary(self._allowance)
-        epoch.replay_acknowledgement = pb.ReplayAcknowledgement.from_binary(
-            acks.acknowledgements[-1]
-        )
+        epoch.replay_acknowledgements = list(acks.batch(launch.request_id))
         self._append(Oneof("epoch_started", epoch), now=now, at=at)
 
     def _load(self) -> None:
@@ -363,7 +362,25 @@ class ReplayRuntime:
             changed = self._prepare_operations(started, now=now, at=at)
             if not changed:
                 break
+        if not started and self._drained:
+            self._park(now=now, at=at)
         return tuple(started)
+
+    @property
+    def _drained(self) -> bool:
+        """Whether this epoch's Pause has no admitted work left in flight."""
+        if self._archive.controls.draining is None:
+            return False
+        unstarted = {span.id for span in self._archive.unstarted_turns}
+        return all(span.id in unstarted for span in self._archive.unresolved)
+
+    def _park(self, *, now: float, at: Timestamp) -> None:
+        lifecycle = self._epoch.lifecycle
+        if lifecycle is None or lifecycle.state is None or lifecycle.state.field != "parked":
+            self._append(
+                Oneof("lifecycle", Lifecycle(state=Oneof("parked", Parked()))), now=now, at=at
+            )
+        self._paused = True
 
     def _prepare_operations(self, started: list[Span], *, now: float, at: Timestamp) -> bool:
         changed = False
@@ -375,11 +392,17 @@ class ReplayRuntime:
             occurrence = (operation.key.to_binary(), operation.identity, operation.encoding_version)
             if occurrence in self._prepared_occurrences:
                 continue
-            outcome = self.accounting.decide(operation, self.allowance)
+            retained = self._archive.pending_logical(operation)
+            execution = (
+                operation if retained is None or retained.replay is None else retained.replay
+            )
+            if not self._admitted(execution):
+                continue
+            outcome = self.accounting.decide(execution, self.allowance)
             if isinstance(outcome, (ReplayIterationBlocked, ReplayResourcesBlocked)):
                 self._admission_limited = True
                 continue
-            span = self._start_operation(operation, now=now, at=at)
+            span = self._start_operation(execution, now=now, at=at)
             self._prepared_occurrences.add(occurrence)
             if outcome is None:
                 started.append(span)
@@ -389,23 +412,118 @@ class ReplayRuntime:
                 changed = True
         return changed
 
+    def _admitted(self, operation: pb.OperationReplay) -> bool:
+        """Whether this epoch's Pause or pause-now still admits a physical turn start."""
+        if self._physical_within(operation) is None:
+            return True
+        retained = self._archive.pending_logical(operation)
+        if retained is not None:
+            bound = None if retained.replay is None else retained.replay.turn_bound
+            return self._archive.controls.admits(retained.id if bound is None else bound.origin)
+        native = _native_turn(operation)
+        turn = None if native is None else native[1]
+        if turn is None or not turn.continuation_of:
+            return self._archive.controls.admits(None)
+        origin = self._archive.span(turn.continuation_of).replay
+        bound = None if origin is None else origin.turn_bound
+        return bound is not None and self._archive.controls.admits(bound.origin)
+
+    def _physical_within(self, operation: pb.OperationReplay) -> float | None:
+        policy = operation.policy
+        if policy is None:
+            return None
+        if policy.has_field("physical_within_seconds"):
+            return policy.physical_within_seconds
+        request = policy.request
+        if (
+            request is not None
+            and request.type_url == replay_agent.ReplayAgentRequest.desc().type_name
+        ):
+            native = replay_agent.ReplayAgentRequest.from_binary(request.value)
+            validate(native)
+            if native.action is not None and native.action.field == "turn":
+                return native.within_seconds
+        return None
+
     def _start_operation(self, operation: pb.OperationReplay, *, now: float, at: Timestamp) -> Span:
         key = operation.key
         if key is None:
             problem = "operation requires a semantic key"
             raise ReplayError(problem)
-        span = Span(
-            id=f"operation/{self._archive.sequence + 1}",
-            runtime_type=RuntimeType.OPERATION,
-            name=key.operation,
-            status=SpanStatus.RUNNING,
-            started_at=self._archive.clock,
-            replay=operation,
+        within = self._physical_within(operation)
+        parent = None if within is None else self._archive.pending_logical(operation)
+        if parent is None:
+            parent = Span(
+                id=f"operation/{self._archive.sequence + 1}",
+                runtime_type=RuntimeType.OPERATION,
+                name=key.operation,
+                status=SpanStatus.RUNNING,
+                started_at=self._archive.clock,
+                replay=operation,
+            )
+            self._bind_turn(parent, now=now)
+            self._append(
+                Oneof("span", SpanRecord(change=Change.STARTED, span=parent)), now=now, at=at
+            )
+        span = (
+            parent
+            if within is None
+            else self._start_physical(parent, within=within, now=now, at=at)
         )
-        self._append(Oneof("span", SpanRecord(change=Change.STARTED, span=span)), now=now, at=at)
         self._dispatchable.add(span.id)
         self._known_starts.add(span.id)
         return deepcopy(span)
+
+    def _bind_turn(self, parent: Span, *, now: float) -> None:
+        operation = parent.replay
+        native = None if operation is None else _native_turn(operation)
+        if operation is None or native is None:
+            return
+        request, turn = native
+        if turn.continuation_of:
+            origin = self._archive.span(turn.continuation_of)
+            if origin.replay is None or origin.replay.turn_bound is None:
+                problem = "continuation requires its original recorded turn bound"
+                raise ReplayError(problem)
+            operation.turn_bound = deepcopy(origin.replay.turn_bound)
+            parent.parent = operation.turn_bound.origin
+        else:
+            operation.turn_bound = pb.ReplayTurnBound(
+                origin=parent.id,
+                deadline=now + request.within_seconds,
+                hold_credit_seconds=turn.hold_credit_seconds,
+            )
+
+    def _start_physical(self, parent: Span, *, within: float, now: float, at: Timestamp) -> Span:
+        if self._fence is None:
+            problem = "physical execution requires current host exclusion"
+            raise ReplayCommitError(problem)
+        children = self._archive.children(parent.id)
+        unresolved = tuple(child for child in children if not child.has_field("ended_at"))
+        if unresolved:
+            raise ReplayRecoveryRequiredError(unresolved)
+        prior = None if not children else children[0].replay_physical
+        bound = None if parent.replay is None else parent.replay.turn_bound
+        deadline = (
+            effective_deadline(bound)
+            if bound is not None
+            else now + within
+            if prior is None
+            else prior.deadline
+        )
+        child = physical_start(
+            parent,
+            identity=f"physical/{self._archive.current_epoch.run_id}/{self._archive.sequence + 1}",
+            host=f"{self._fence.host_id}/{self._fence.epoch}",
+            deadline=deadline,
+            ordinal=len(children),
+        )
+        child.started_at = self._archive.clock
+        if child.replay_physical is not None:
+            origin = parent.id if bound is None else bound.origin
+            child.replay_physical.guidance = list(self._archive.controls.guidance(origin))
+        self._append(Oneof("span", SpanRecord(change=Change.STARTED, span=child)), now=now, at=at)
+        return child
 
     @property
     def admission_limited(self) -> bool:
@@ -518,7 +636,11 @@ class ReplayRuntime:
         try:
             return await executor.execute(self._span(span_id), self._fence)
         except BaseException:
-            self._halted = True
+            # A withdrawn child is already ineligible and stays unended for its
+            # owner's inspection, so its cancellation or failure leaves the writer whole.
+            physical = self._span(span_id).replay_physical
+            if physical is None or not physical.has_field("withdrawn_sequence"):
+                self._halted = True
             raise
 
     def observe(
@@ -551,12 +673,25 @@ class ReplayRuntime:
             raise ReplayError(problem)
         # The start owns the retained reply descriptors. A compatible recovered
         # reply may belong to a file whose unrelated declarations have changed.
-        span.replay_observation = pb.ReplayObservation(
+        observed = pb.ReplayObservation(
             outcome=Any(type_url=result.outcome.desc().type_name, value=result.outcome.to_binary()),
             paid=result.paid,
             cost_usd=cost,
             usage=deepcopy(result.usage),
+            turn=deepcopy(result.turn),
         )
+        if span.replay_observation is not None:
+            if span.replay_observation == observed:
+                return
+            problem = "physical observation cannot be replaced or removed"
+            raise ReplayError(problem)
+        span.replay_observation = observed
+        physical = span.replay_physical
+        if physical is not None:
+            physical.observed_sequence = self._archive.sequence + 1
+            if not physical.has_field("withdrawn_sequence"):
+                span.status = SpanStatus.DONE
+                span.ended_at = self._archive.clock if clock is None else clock
         self._append(
             Oneof("span", SpanRecord(change=Change.UPDATED, span=span)), now=now, at=at, clock=clock
         )
@@ -572,6 +707,18 @@ class ReplayRuntime:
             raise
 
     def _accept_record(self, span: Span, *, now: float, at: Timestamp) -> Record:
+        if span.replay_physical is not None:
+            winner = self._archive.eligible_child(span.replay_physical.logical)
+            if winner is None or winner.id != span.id:
+                problem = "only the first eligible physical child may be accepted"
+                raise ReplayError(problem)
+            parent = self._span(span.replay_physical.logical)
+            if parent.replay is None or parent.replay.outcome is not None:
+                problem = "logical operation already accepted a physical child"
+                raise ReplayError(problem)
+            parent.replay.accepted_child = span.id
+            parent.replay_observation = deepcopy(span.replay_observation)
+            span = parent
         observed, operation = span.replay_observation, span.replay
         if observed is None or operation is None:
             problem = "acceptance needs a durable observation"
@@ -586,6 +733,197 @@ class ReplayRuntime:
         span.status, span.ended_at = SpanStatus.DONE, self._archive.clock
         return self._append(
             Oneof("span", SpanRecord(change=Change.ENDED, span=span)), now=now, at=at
+        )
+
+    def writer_intent(self, manifest: pb.WriterManifest, *, now: float, at: Timestamp) -> None:
+        """W2: commit the environment's complete closed grant set before cleanup I/O."""
+        self._writer_fact(manifest, now=now, at=at)
+
+    def control(
+        self, control: pb.ReplayControl, *, now: float, at: Timestamp
+    ) -> pb.ReplayControlDisposition:
+        """Record ``control``'s disposition before its inbox entry is settled or rejected.
+
+        A stale control is recorded as stale and changes nothing. Pause-now records
+        the children it withdraws, then withdraws each before any cancellation. It
+        names only children neither ended nor withdrawn; this writer ends every child
+        it observes without withdrawal, so a named child has no eligible observation.
+        A repeated request returns its recorded disposition and finishes its
+        withdrawals, skipping a named child that has ended since.
+        """
+        _ = self._active_scheduler
+        validate(control)
+        disposition = self._archive.controls.disposition(control.request_id)
+        if disposition is None:
+            disposition = classify_control(control, self._archive.control_view())
+            self._record_schemas((pb.ReplayControlDisposition,), now=now, at=at)
+            self._append(
+                Oneof(
+                    "notice",
+                    Notice(
+                        severity=Severity.WARNING,
+                        code=NoticeCode.FRAMEWORK_WARNING,
+                        message="Operator control disposed.",
+                        detail=Any(
+                            type_url=disposition.desc().type_name, value=disposition.to_binary()
+                        ),
+                    ),
+                ),
+                now=now,
+                at=at,
+            )
+        elif disposition.control != control:
+            problem = "one control request id has contradictory content"
+            raise ReplayError(problem)
+        applied = applied_control(disposition)
+        if applied is not None and self._archive.controls.halted:
+            for identity in applied.withdrawn:
+                child = self._span(identity)
+                if not child.has_field("ended_at"):
+                    self.withdraw(identity, now=now, at=at)
+            self._park(now=now, at=at)
+        return disposition
+
+    def interrupt(self, reason: str, summary: str, *, now: float, at: Timestamp) -> None:
+        """End the open epoch as interrupted and resumable, retaining its starts for inspection."""
+        _ = self._active_scheduler
+        if not epoch_has_ended(self._epoch):
+            self._interrupted(reason, summary, now=now, at=at)
+
+    def _interrupted(self, reason: str, summary: str, *, now: float, at: Timestamp) -> None:
+        self._append(
+            Oneof(
+                "lifecycle",
+                Lifecycle(
+                    state=Oneof(
+                        "ended",
+                        Ended(
+                            outcome=Outcome.INTERRUPTED,
+                            summary=summary,
+                            resumable=True,
+                            interruption_reason=reason,
+                        ),
+                    )
+                ),
+            ),
+            now=now,
+            at=at,
+        )
+
+    def tool_fact(
+        self,
+        fact: pb.ReplayToolSubmission | pb.ReplayToolAcknowledgement | pb.ReplayTurnWait,
+        *,
+        now: float,
+        at: Timestamp,
+    ) -> SuspensionRefusal | None:
+        """Retain authenticated obligations before tool replies or yield acceptance.
+
+        Only the active physical turn may create submissions and waits. A wait the
+        suspension gate refuses is not recorded; its typed reason is returned. Reply
+        acknowledgements can settle retained obligations after a host restart.
+        """
+        _ = self._active_scheduler
+        validate(fact)
+        turn = self._archive.span(fact.turn)
+        if not isinstance(fact, pb.ReplayToolAcknowledgement) and (
+            self._fence is None
+            or turn.replay_physical is None
+            or turn.replay_physical.host_incarnation != f"{self._fence.host_id}/{self._fence.epoch}"
+        ):
+            problem = "tool submission or wait belongs to another host incarnation"
+            raise ReplayError(problem)
+        if isinstance(fact, pb.ReplayTurnWait):
+            refusal = self._archive.dependencies.refusal(fact, self._archive.span, now=now)
+            if refusal is not None and self._archive.dependencies.yielded(fact.turn) != fact:
+                return refusal
+        detail = Any(type_url=fact.desc().type_name, value=fact.to_binary())
+        dependencies = self._archive.dependencies.record(detail, self._archive.span)
+        if dependencies == self._archive.dependencies:
+            return None
+        self._record_schemas((type(fact),), now=now, at=at)
+        self._append(
+            Oneof(
+                "notice",
+                Notice(
+                    severity=Severity.WARNING,
+                    code=NoticeCode.FRAMEWORK_WARNING,
+                    message="Turn tool dependency retained.",
+                    detail=detail,
+                ),
+            ),
+            now=now,
+            at=at,
+        )
+        return None
+
+    def writer_observation(
+        self, result: pb.WriterReconciliation, *, now: float, at: Timestamp
+    ) -> None:
+        """W7: persist proof or a typed blocked diagnostic before any hold release."""
+        self._writer_fact(result, now=now, at=at)
+
+    def accounting_evidence(
+        self, evidence: pb.AccountingEvidence, *, now: float, at: Timestamp
+    ) -> None:
+        """Append import history or a delayed observation through this single writer.
+
+        Republishing an import already in the prefix appends nothing, so repeated
+        import or recovery never charges twice. Contradictory evidence fails before
+        commit; imported occurrences never debit this epoch's allowance.
+        """
+        validate(evidence)
+        if (
+            evidence.has_field("import_id")
+            and self._archive.accounting_publication(evidence.import_id) == evidence
+        ):
+            return
+        self._record_schemas((type(evidence),), now=now, at=at)
+        self._append(
+            Oneof(
+                "notice",
+                Notice(
+                    severity=Severity.WARNING,
+                    code=NoticeCode.FRAMEWORK_WARNING,
+                    message="Accounting evidence retained.",
+                    detail=Any(type_url=evidence.desc().type_name, value=evidence.to_binary()),
+                ),
+            ),
+            now=now,
+            at=at,
+        )
+
+    def _writer_fact(
+        self, value: pb.WriterManifest | pb.WriterReconciliation, *, now: float, at: Timestamp
+    ) -> None:
+        validate(value)
+        self._record_schemas((type(value),), now=now, at=at)
+        records = ReplayRecords.from_binary(self._archive.encode()).records
+        candidate = Record(
+            body=Oneof(
+                "notice",
+                Notice(detail=Any(type_url=value.desc().type_name, value=value.to_binary())),
+            )
+        )
+        ReplayWriterRecovery.from_records((*records, candidate))
+        blocked = isinstance(value, pb.WriterReconciliation) and value.proof is None
+        message = (
+            "Recovery blocked: previous writers may still modify this workspace"
+            if blocked
+            else "Writer reconciliation evidence retained."
+        )
+        self._append(
+            Oneof(
+                "notice",
+                Notice(
+                    severity=Severity.WARNING,
+                    code=NoticeCode.FRAMEWORK_WARNING,
+                    message=message,
+                    detail=Any(type_url=value.desc().type_name, value=value.to_binary()),
+                ),
+            ),
+            now=now,
+            at=at,
         )
 
     def advance_clock(self, clock: float, *, now: float, at: Timestamp) -> None:
@@ -617,7 +955,12 @@ class ReplayRuntime:
     def recovery(self) -> tuple[Span, ...]:
         """Inherited starts requiring their owner's inspection before any live dispatch."""
         _ = self._active_scheduler
-        return tuple(span for span in self._archive.unresolved if span.id not in self._known_starts)
+        unstarted = {span.id for span in self._archive.unstarted_turns}
+        return tuple(
+            span
+            for span in self._archive.unresolved
+            if span.id not in self._known_starts and span.id not in unstarted
+        )
 
     async def inspect(
         self, span_id: str, executor: ReplayExecutor, *, now: float
@@ -650,14 +993,121 @@ class ReplayRuntime:
         self._recovery_dirty = True
         if isinstance(result, ReplayResult):
             self.observe(span_id, result, now=now, at=at)
-            self._accept_record(self._span(span_id), now=now, at=at)
+            if span.replay_physical is None or not span.replay_physical.has_field(
+                "withdrawn_sequence"
+            ):
+                self._accept_record(self._span(span_id), now=now, at=at)
         elif isinstance(result, ReplayAbsent):
+            if span.replay_physical is not None:
+                self.withdraw(span_id, now=now, at=at)
+                span = self._span(span_id)
+                if span.replay_physical is not None:
+                    span.replay_physical.confirmed_absent = True
             span.status, span.ended_at = SpanStatus.STOPPED, self._archive.clock
             span.stop = Stop(requested_at=self._archive.clock, landed=True)
             self._append(Oneof("span", SpanRecord(change=Change.ENDED, span=span)), now=now, at=at)
 
         else:
             assert_never(result)
+
+    def withdraw(self, span_id: str, *, now: float, at: Timestamp) -> None:
+        """W4: durable ineligibility precedes cancellation; it proves no writer death."""
+        span = self._span(span_id)
+        physical = span.replay_physical
+        if physical is None:
+            problem = "withdrawal requires a physical child"
+            raise ReplayError(problem)
+        parent = self._span(physical.logical)
+        if parent.replay is not None and parent.replay.accepted_child == span.id:
+            problem = "an accepted child cannot be withdrawn"
+            raise ReplayError(problem)
+        if physical.has_field("withdrawn_sequence"):
+            return
+        if span.replay_observation is not None:
+            problem = "a durable eligible observation must be accepted before withdrawing more work"
+            raise ReplayError(problem)
+        physical.withdrawn_sequence = self._archive.sequence + 1
+        span.stop = Stop(requested_at=self._archive.clock, landed=span.has_field("ended_at"))
+        if span.has_field("ended_at"):
+            span.status = SpanStatus.STOPPED
+        self._append(Oneof("span", SpanRecord(change=Change.UPDATED, span=span)), now=now, at=at)
+        self._dispatchable.discard(span_id)
+
+    def _reuse_for(self, span: Span, reuse: ReplayRootReuse) -> None:
+        proof = reuse.proof()
+        if proof.manifest is None or proof.manifest.backing is None:
+            problem = "writer proof omitted its backing"
+            raise ReplayError(problem)
+        recorded = ReplayWriterRecovery.from_records(
+            ReplayRecords.from_binary(self._archive.encode()).records
+        ).require(proof.manifest.backing)
+        if recorded != reuse:
+            problem = "physical termination requires its committed environment proof"
+            raise ReplayError(problem)
+        proof_covers(span, proof, run_id=self._archive.current_epoch.run_id)
+
+    async def retire(
+        self,
+        span_id: str,
+        executor: ReplayRetirement,
+        writers: WriterRegistry,
+        *,
+        clock: Clock,
+    ) -> None:
+        """Settle access under backing exclusion after its committed environment proof."""
+        now = clock.now()
+        at = Timestamp(seconds=int(now), nanos=int((now - int(now)) * 1_000_000_000))
+        if self._fence is None or not self._store.verify(self._fence, now):
+            problem = "retirement requires current host exclusion"
+            raise ReplayCommitError(problem)
+        reuse = ReplayWriterRecovery.from_records(
+            ReplayRecords.from_binary(self._archive.encode()).records
+        ).require(writers.backing)
+        with writers.acquire(reuse, run_id=self._archive.current_epoch.run_id, fence=self._fence):
+            span = self._span(span_id)
+            self._reuse_for(span, reuse)
+            if span.replay_physical is None or not span.replay_physical.has_field(
+                "withdrawn_sequence"
+            ):
+                problem = "commit withdrawal before stopping a writer"
+                raise ReplayError(problem)
+            if not span.replay_physical.has_field("settlement_sequence"):
+                span.replay_physical.settlement_sequence = self._archive.sequence + 1
+                span.replay_physical.termination_proof_digest = proof_digest(reuse.proof())
+                self._append(
+                    Oneof("span", SpanRecord(change=Change.UPDATED, span=span)), now=now, at=at
+                )
+            try:
+                await executor.retire(span, self._fence, reuse)
+                now = clock.now()
+                at = Timestamp(seconds=int(now), nanos=int((now - int(now)) * 1_000_000_000))
+                self._confirm_stopped(span_id, reuse, now=now, at=at)
+            except BaseException:
+                self._halted = True
+                raise
+
+    def _confirm_stopped(
+        self, span_id: str, reuse: ReplayRootReuse, *, now: float, at: Timestamp
+    ) -> None:
+        span = self._span(span_id)
+        self._reuse_for(span, reuse)
+        physical = span.replay_physical
+        if physical is None or not physical.has_field("withdrawn_sequence"):
+            problem = "commit withdrawal before confirming writer termination"
+            raise ReplayError(problem)
+        # The settlement intent retains its historical death witness. Current
+        # reuse authority was checked above and may belong to a later generation.
+        if span.has_field("ended_at"):
+            return
+        span.status = SpanStatus.STOPPED
+        if not span.has_field("ended_at"):
+            span.ended_at = self._archive.clock
+        span.stop = Stop(
+            requested_at=span.stop.requested_at if span.stop is not None else self._archive.clock,
+            landed=True,
+        )
+        self._append(Oneof("span", SpanRecord(change=Change.ENDED, span=span)), now=now, at=at)
+        self._recovery_dirty = True
 
     def finish_recovery(self) -> None:
         """Reconstruct the root from inspected outcomes before permitting fresh work."""
@@ -686,8 +1136,11 @@ class ReplayRuntime:
             raise
 
     def _complete_observed(self, *, now: float, at: Timestamp) -> None:
+        pending = self._archive.pending_observation
+        if pending is not None and pending.replay_physical is not None:
+            self._accept_record(pending, now=now, at=at)
         for span in self._archive.unresolved:
-            if span.replay_observation is not None:
+            if span.replay_physical is None and span.replay_observation is not None:
                 self._accept_record(span, now=now, at=at)
 
     def _span(self, span_id: str) -> Span:
@@ -715,14 +1168,20 @@ class ReplayRuntime:
         if not state.resumable:
             problem = "replay epochs must remain resumable"
             raise ReplayError(problem)
+        unstarted = self._archive.unstarted_turns
+        without_execution = {span.id for span in unstarted}
         if (
             not scheduler.completed
             or scheduler.frontier().unused
-            or self._archive.unresolved
+            or any(span.id not in without_execution for span in self._archive.unresolved)
             or self._archive.epoch_closed
         ):
             problem = "an epoch can finish only after replay, disclosure and owned work settle"
             raise ReplayError(problem)
+        for span in unstarted:
+            span.status, span.ended_at = SpanStatus.STOPPED, self._archive.clock
+            span.stop = Stop(requested_at=self._archive.clock, landed=True)
+            self._append(Oneof("span", SpanRecord(change=Change.ENDED, span=span)), now=now, at=at)
         self._record_schemas(scheduler.schema_types, now=now, at=at)
         self._record_drift(now=now, at=at)
         if ending.detail is not None:
@@ -765,3 +1224,19 @@ class ReplayRuntime:
         finally:
             if self._fence is not None:
                 self._store.release(self._fence, now)
+
+
+def _native_turn(
+    operation: pb.OperationReplay,
+) -> tuple[replay_agent.ReplayAgentRequest, replay_agent.ReplayAgentTurn] | None:
+    """The native agent request and turn of a turn operation, or None for any other one."""
+    request = None if operation.policy is None else operation.policy.request
+    if request is None or request.type_url != replay_agent.ReplayAgentRequest.desc().type_name:
+        return None
+    native = replay_agent.ReplayAgentRequest.from_binary(request.value)
+    validate(native)
+    match native.action:
+        case Oneof("turn", turn) if isinstance(turn, replay_agent.ReplayAgentTurn):
+            return native, turn
+        case _:
+            return None

@@ -18,6 +18,7 @@ import {
   registryClusters,
   registryProjects,
   registryReads,
+  registrySavedRuns,
   registrySetup,
   registryStart,
   runWatch,
@@ -167,6 +168,7 @@ function installGateway(manager: ConnectionManager, settings: SettingsStore) {
     settings,
     fileURLToPath(new URL('../gateway/', import.meta.url)),
     realTimers,
+    log,
   );
 }
 
@@ -336,6 +338,12 @@ function listedHosts(parts: {
       setup,
       ...(endLogin === undefined ? {} : {endLogin}),
       runs,
+      savedRuns: registrySavedRuns({
+        checkout: async id =>
+          (await settings.hosts()).settings.hosts[hostKey(id)]?.checkout ??
+          (id.kind === 'local' ? REPOSITORY_ROOT : null),
+        unary: (id, bytes, signal) => gateway.unary(hostKey(id), READ_METHOD, bytes, signal),
+      }),
       log,
       push: listing => {
         notifier.listing(listing);

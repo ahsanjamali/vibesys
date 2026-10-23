@@ -38,7 +38,7 @@ pnpm_packages = []
 
 [[cases]]
 name = "repoctl code and policy changes select all checks"
-paths = ["support/repoctl/main.go", ".repoctl/components.toml", ".repoctl/checks.toml"]
+paths = ["support/repoctl/main.go", ".repoctl/components.toml", ".repoctl/checks.toml", ".github/actions/setup-runner-apt/action.yml"]
 jobs = ["agent_image", "evaluators", "examples", "impact", "python", "real_tiers", "stitch", "clients", "proto", "gateway"]
 [cases.collections]
 native_languages = "all"
@@ -344,9 +344,72 @@ native_targets = []
 pnpm_packages = []
 
 [[cases]]
+name = "shared image cache changes exercise every builder consumer"
+paths = ["scripts/ci_image_cache.py", "scripts/ci_registry_image_cache.sh", ".github/actions/docker-image-cache/action.yml"]
+jobs = ["agent_image", "python", "real_tiers"]
+[cases.collections]
+native_languages = []
+native_targets = []
+pnpm_packages = []
+
+[[cases]]
 name = "proto compatibility entry and regression select contract verification"
 paths = ["scripts/check_proto_breaking.sh", "scripts/tests/test_proto_breaking.sh"]
 jobs = ["proto", "python"]
+[cases.collections]
+native_languages = []
+native_targets = []
+pnpm_packages = []
+
+[[cases]]
+name = "generated checkout compatibility remains a light Python module"
+paths = ["src/server/host_compatibility_generated.py"]
+jobs = ["python"]
+[cases.collections]
+native_languages = []
+native_targets = []
+pnpm_packages = []
+
+[[cases]]
+name = "native saved-run metadata selects its consumers"
+paths = ["src/server/host_saved_runs.py"]
+jobs = ["python"]
+[cases.collections]
+native_languages = []
+native_targets = []
+pnpm_packages = []
+
+[[cases]]
+name = "request identity changes reach every client request producer"
+paths = ["clients/libs/request-identity/src/index.ts"]
+jobs = ["clients"]
+[cases.collections]
+native_languages = []
+native_targets = []
+pnpm_packages = { dependents_of = "pnpm:@vibesys/request-identity" }
+
+[[cases]]
+name = "Pause-now escalation selects its Python owners"
+paths = ["src/vibesys/api/host_terminate.py"]
+jobs = ["python"]
+[cases.collections]
+native_languages = []
+native_targets = []
+pnpm_packages = []
+
+[[cases]]
+name = "facts importer selects Python verification"
+paths = ["src/vibesys/fact_import/api.py", "src/vibesys/fact_import/_accepted.py", "src/vibesys/api/importing.py", "libs/vs-project/src/vs_project/api/retained.py", "libs/vs-runtime/src/vs_runtime/api/retained.py"]
+jobs = ["python", "real_tiers"]
+[cases.collections]
+native_languages = []
+native_targets = []
+pnpm_packages = []
+
+[[cases]]
+name = "shared imported facts select proto verification"
+paths = ["proto/vibesys/core/v1/imported_facts.proto"]
+jobs = ["proto"]
 [cases.collections]
 native_languages = []
 native_targets = []

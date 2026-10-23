@@ -14,7 +14,9 @@ import {
   SteerTargetKind,
   TailRequestSchema,
   TailResponseSchema,
+  TerminateRunOutcome,
 } from '@vibesys/proto';
+import {refusalMessage} from './refusal.js';
 
 export type {IntentState, PostIntentRequest, PostIntentResponse} from '@vibesys/proto';
 export {IntentStep} from '@vibesys/proto';
@@ -97,9 +99,12 @@ export function configuredHostCall(bytes: Uint8Array, checkout: string | null): 
 
 /** A typed negative HostCall reply, distinct from an uncertain transport failure. */
 export class IntentRefused extends Error {
+  /** The host's stderr, for logs. */
+  readonly diagnostic: string;
   constructor(failure: ConfigurationFailed) {
-    super(`${failure.message}${failure.stderr ? `: ${failure.stderr}` : ''}`);
+    super(refusalMessage(failure));
     this.name = 'IntentRefused';
+    this.diagnostic = failure.stderr;
   }
 }
 
@@ -119,7 +124,43 @@ export function hostIntentResponse(bytes: Uint8Array, requestId: string): PostIn
   }
   if (response.result.case !== 'postIntent' || response.result.value.requestId !== requestId)
     throw new Error('HostCall returned an invalid admission reply');
+  intentAdmissionWarning(response.result.value);
   return response.result.value;
+}
+
+/** Admission and process observation never claim that a control was applied. */
+export function intentAdmissionWarning(response: PostIntentResponse): string | null {
+  const order = response.orderedReader
+    ? null
+    : 'Posting order has not been confirmed. Start or restart this run with the current VibeSys.';
+  const termination = response.termination;
+  if (!termination) return order;
+  if (termination.requestId !== response.requestId)
+    throw new Error('Termination identity mismatch');
+  let observation: string;
+  switch (termination.outcome) {
+    case TerminateRunOutcome.WRITER_RELEASED:
+      observation = 'Pause now recorded. Waiting for the run to publish its status.';
+      break;
+    case TerminateRunOutcome.IDENTITY_CHANGED:
+      observation = 'The run process changed. Pause now was not escalated.';
+      break;
+    case TerminateRunOutcome.UNSUPPORTED:
+      observation = 'Pause now recorded. Safe process termination is unsupported on this host.';
+      break;
+    case TerminateRunOutcome.REQUESTED_UNCONFIRMED:
+      observation = 'Termination requested. The run process has not confirmed its exit.';
+      break;
+    case TerminateRunOutcome.OBSERVATION_UNKNOWN:
+      observation = 'Pause now recorded. The run process identity could not be confirmed.';
+      break;
+    case TerminateRunOutcome.PROCESS_ABSENT:
+      observation = 'The run process was absent. Waiting for the run to publish its status.';
+      break;
+    default:
+      throw new Error('Unknown termination outcome');
+  }
+  return [order, observation].filter(value => value !== null).join(' ');
 }
 
 export function intentTailRequest(runId: string): Uint8Array {

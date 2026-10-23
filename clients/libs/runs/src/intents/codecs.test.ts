@@ -1,6 +1,7 @@
 import {expect, test} from 'bun:test';
 import {create, fromBinary, toBinary} from '@bufbuild/protobuf';
 import {
+  HOST_UNSUPPORTED_MESSAGE,
   HostCallRequestSchema,
   HostCallResponseSchema,
   IntentAction,
@@ -9,12 +10,14 @@ import {
   SteerMode,
   SteerTargetKind,
   TailResponseSchema,
+  TerminateRunOutcome,
 } from '@vibesys/proto';
 import {
   configuredHostCall,
   hostIntentRequest,
   hostIntentResponse,
   IntentRefused,
+  intentAdmissionWarning,
   intentTailResponse,
   runIntent,
   runReference,
@@ -85,7 +88,13 @@ test('only IntentState records are outcomes, with refusal reasons preserved', ()
 });
 
 test('typed HostCall refusals remain distinct from malformed or unconfirmed replies', () => {
-  for (const code of ['invalid_input', 'inbox_closed', 'request_too_large', 'invalid_method']) {
+  for (const code of [
+    'invalid_input',
+    'inbox_closed',
+    'request_too_large',
+    'invalid_method',
+    'host_unsupported',
+  ]) {
     for (const stderr of ['', 'details']) {
       const bytes = toBinary(
         HostCallResponseSchema,
@@ -103,6 +112,17 @@ test('typed HostCall refusals remain distinct from malformed or unconfirmed repl
         }),
       );
       expect(() => hostIntentResponse(bytes, 'r-1')).toThrow(IntentRefused);
+      let refusal: IntentRefused | undefined;
+      try {
+        hostIntentResponse(bytes, 'r-1');
+      } catch (error) {
+        refusal = error as IntentRefused;
+      }
+      // The host's stderr is for logs; a host that lacks the command says it needs an update.
+      expect(refusal?.diagnostic).toBe(stderr);
+      expect(refusal?.message).toBe(
+        code === 'host_unsupported' ? HOST_UNSUPPORTED_MESSAGE : 'Request refused',
+      );
     }
   }
 });
@@ -135,4 +155,51 @@ test('a control reference requires both its project path and run identity', () =
     projectRoot: '/project',
     runId: 'run-1',
   });
+});
+
+test('every process outcome remains distinct and never confirms control application', () => {
+  const warnings = new Set<string | null>();
+  for (const outcome of [
+    TerminateRunOutcome.WRITER_RELEASED,
+    TerminateRunOutcome.IDENTITY_CHANGED,
+    TerminateRunOutcome.UNSUPPORTED,
+    TerminateRunOutcome.REQUESTED_UNCONFIRMED,
+    TerminateRunOutcome.OBSERVATION_UNKNOWN,
+    TerminateRunOutcome.PROCESS_ABSENT,
+  ]) {
+    const bytes = toBinary(
+      HostCallResponseSchema,
+      create(HostCallResponseSchema, {
+        result: {
+          case: 'postIntent',
+          value: {requestId: 'r-1', orderedReader: true, termination: {requestId: 'r-1', outcome}},
+        },
+      }),
+    );
+    const response = hostIntentResponse(bytes, 'r-1');
+    const warning = intentAdmissionWarning(response);
+    expect(warning).not.toBeNull();
+    expect(warning).not.toMatch(/\bstopped\b|\bapplied\b/);
+    warnings.add(warning);
+  }
+  expect(warnings.size).toBe(6);
+  for (const [outcome, requestId] of [
+    [TerminateRunOutcome.UNSPECIFIED, 'r-1'],
+    [999, 'r-1'],
+    [TerminateRunOutcome.UNSUPPORTED, 'another'],
+  ] as const) {
+    const bytes = toBinary(
+      HostCallResponseSchema,
+      create(HostCallResponseSchema, {
+        result: {
+          case: 'postIntent',
+          value: {
+            requestId: 'r-1',
+            termination: {requestId, outcome: outcome as TerminateRunOutcome},
+          },
+        },
+      }),
+    );
+    expect(() => hostIntentResponse(bytes, 'r-1')).toThrow();
+  }
 });

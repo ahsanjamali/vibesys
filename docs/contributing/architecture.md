@@ -168,6 +168,7 @@ graph TD
     server --> vs_prompts
     server --> vs_proto
     server --> vs_redaction
+    server --> vs_runlog
     server --> vs_sim
     server --> vs_slurm
     vibesys --> vs_agent
@@ -197,6 +198,7 @@ graph TD
     vs_agent --> vs_sim
     vs_async_ops --> vs_sim
     vs_core --> vs_proto
+    vs_core --> vs_runlog
     vs_dst --> vs_core
     vs_dst --> vs_project
     vs_dst --> vs_runtime

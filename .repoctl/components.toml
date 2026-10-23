@@ -194,7 +194,7 @@ id = "agent_image"
 class = "manual"
 job = "agent_image"
 roots = ["libs/vs-agent/src/vs_agent/images", "libs/vs-sandbox", "libs/vs-runtime/src/vs_runtime/features"]
-files = ["libs/vs-agent/src/vs_agent/images.py", "libs/vs-agent/src/vs_agent/agent_feature.py", "libs/vs-agent/src/vs_agent/provider_policy.py", "libs/vs-runtime/src/vs_runtime/_image_features.py", "scripts/ci_docker_data_root.sh"]
+files = ["libs/vs-agent/src/vs_agent/images.py", "libs/vs-agent/src/vs_agent/agent_feature.py", "libs/vs-agent/src/vs_agent/provider_policy.py", "libs/vs-runtime/src/vs_runtime/_image_features.py", "scripts/ci_docker_data_root.sh", "scripts/ci_ubuntu_mirror.py", "scripts/ci_image_cache.py", "scripts/ci_registry_image_cache.sh", ".github/actions/docker-image-cache/action.yml"]
 
 [[components]]
 id = "real_tiers"
@@ -235,6 +235,9 @@ files = [
   "scripts/run_slurm_cluster_tests.sh",
   "scripts/run_minimal_container_tests.sh",
   "scripts/ci_docker_data_root.sh",
+  "scripts/ci_image_cache.py",
+  "scripts/ci_registry_image_cache.sh",
+  ".github/actions/docker-image-cache/action.yml",
 ]
 
 [[components]]
@@ -277,7 +280,7 @@ to = "native:examples/data-structures/repositories/queue-rs"
 id = "repo_policy"
 # Policy inputs affect every CI selection.
 roots = ["support/repoctl", ".repoctl"]
-files = [".github/workflows/test.yml", ".github/actions/setup-clients/action.yml", ".github/actions/setup-clients/retry-download.sh", ".github/actions/setup-repoctl/action.yml", ".github/actions/docker-cache-week/action.yml", "tests/repoctl/cases.toml"]
+files = [".github/workflows/test.yml", ".github/actions/setup-clients/action.yml", ".github/actions/setup-clients/retry-download.sh", ".github/actions/setup-repoctl/action.yml", ".github/actions/docker-cache-week/action.yml", ".github/actions/setup-runner-apt/action.yml", "tests/repoctl/cases.toml"]
 select_all_jobs = true
 select_all_collections = true
 # CI selects everything for a policy change; a local `repoctl test` runs only repoctl's own

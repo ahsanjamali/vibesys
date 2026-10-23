@@ -1,7 +1,7 @@
 import {describe, expect, test} from 'bun:test';
 import {join} from 'node:path';
-import {type ConnectionLease, ConnectionManager} from '@vibesys/connection';
-import {FAKE_MODEL_CATALOGUE, FakeLink, record} from '@vibesys/connection/testing';
+import {type ConnectionLease, ConnectionManager, registrySetup} from '@vibesys/connection';
+import {FAKE_MODEL_CATALOGUE, FakeLink, olderHost, record} from '@vibesys/connection/testing';
 import {RUN_EVENT_TYPES_BY_KINDS, type RunSummary} from '@vibesys/contracts/host-helper';
 import {type HostId, type HostListing, hostKey} from '@vibesys/hosts';
 import {remember, SettingsStore, settingsFor, withHostSettings} from '@vibesys/settings';
@@ -247,7 +247,17 @@ function subject(filesystem: SshConfigFilesystem): Hosts {
 }
 
 /** The public completion controller over one in-memory helper and settings store. */
-function completionSubject(link: FakeLink): {
+function completionSubject(
+  link: FakeLink,
+  native?: {
+    enabled: boolean;
+    list: (
+      host: HostId,
+      project: string,
+      signal: AbortSignal,
+    ) => Promise<readonly import('@vibesys/hosts').ListedRun[]>;
+  },
+): {
   readonly hosts: Hosts;
   readonly manager: ConnectionManager;
 } {
@@ -272,6 +282,7 @@ function completionSubject(link: FakeLink): {
       settings,
       localCheckout: '/bundled',
       sshConfigPath: '/missing',
+      ...(native ? {transportV2: async () => native.enabled, savedRuns: {list: native.list}} : {}),
       log: () => {},
       push: () => {},
       retire: () => {},
@@ -460,6 +471,15 @@ describe('Hosts.setCheckout transport v2', () => {
       }),
     };
   }
+
+  test('a host whose VibeSys predates the registry cannot complete paths or take a checkout, and says it needs an update', async () => {
+    const {hosts, manager} = v2Hosts(registrySetup({unary: olderHost.read}));
+    await using _manager = manager;
+    await expect(hosts.complete(LOCAL, '/manual/')).resolves.toEqual({kind: 'unsupported'});
+    await expect(
+      hosts.setCheckout(LOCAL, '/candidate', {owner: 'doc', sequence: 1}),
+    ).rejects.toThrow("This host's VibeSys needs an update");
+  });
 
   test('saves a found compatible checkout without starting the helper', async () => {
     const {hosts, settings, manager} = v2Hosts({
@@ -2737,5 +2757,29 @@ function inspectorHosts(manager: ConnectionManager): Hosts {
     log: () => {},
     push: () => {},
     retire: () => {},
+  });
+}
+
+for (const enabled of [false, true]) {
+  test(`saved-run discovery selects only the chosen transport (${enabled})`, async () => {
+    const link = new FakeLink();
+    link.helper.host.projects.set('/srv/project', ['mpmc']);
+    let calls = 0;
+    const subject = completionSubject(link, {
+      enabled,
+      list: async (_host, project, signal) => {
+        expect(project).toBe('/srv/project');
+        expect(signal.aborted).toBe(false);
+        calls += 1;
+        return [{runId: 'native-run', name: 'Native run', task: null, createdAt: 1}];
+      },
+    });
+    await using _manager = subject.manager;
+    const rows = await subject.hosts.projectRuns(LOCAL, '/srv/project');
+    expect(calls).toBe(enabled ? 1 : 0);
+    expect(link.helper.requests.filter(request => request.type === 'runs.list')).toHaveLength(
+      enabled ? 0 : 1,
+    );
+    if (enabled) expect(rows[0]?.runId).toBe('native-run');
   });
 }

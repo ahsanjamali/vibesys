@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import json
 import runpy
+from contextlib import closing
 from importlib.metadata import version
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -21,10 +22,21 @@ from vibesys.run.runlog_tee import RunLogTee
 from vs_core.api import ENVELOPE_SCHEMA_VERSION, FlowState, RunEnvelope, Span, SpanStatus, SpanType
 from vs_core.api.testing import FAKE_REGISTRY
 from vs_project.api import Project, StoredEnvelope
-from vs_proto.api import RUN_LOG_MAGIC, EpochStarted, Keyframe, LegacyEvent, Oneof, Record, RunHead
+from vs_proto.api import (
+    API_SCHEMA_HASH,
+    RUN_LOG_MAGIC,
+    STORE_SCHEMA_HASH,
+    EpochStarted,
+    Keyframe,
+    LegacyEvent,
+    Oneof,
+    Record,
+    RunHead,
+)
 from vs_runlog.api import (
     FileRunContent,
     FileRunLogWriter,
+    RunLock,
     RunLogReader,
     encode_frame,
     fold_skeleton,
@@ -60,6 +72,25 @@ def record_trace(journal: EventJournal) -> None:
             )
         ),
     )
+
+
+def test_conversion_cannot_replace_a_live_writers_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, journal = journal_at(tmp_path, monkeypatch)
+    record_trace(journal)
+    source = Project.event_journal_path_for(project.root, "run-1")
+    journal.emit(
+        CoreEventType.AGENT_OUTPUT_CHUNK,
+        data=AgentOutputChunkData(channel="assistant", content="recorded output"),
+    )
+    original = source.read_bytes()
+    destination = Project.run_log_path_for(project.root, "run-1")
+    with closing(RunLock(destination.parent / "run.lock")), pytest.raises(BlockingIOError):
+        convert_run(project, "run-1", clock=ManualClock(), threads=SimThreads())
+    assert not destination.exists()
+    assert source.read_bytes() == original
+    assert not (destination.parent / "streams").exists()
 
 
 @pytest.mark.parametrize("clock_start", [-0.5, 0.0, 100.25])
@@ -425,6 +456,21 @@ def test_bulk_reports_a_store_only_run_as_unsupported_in_phase_two(
     assert rows[0].result.status is ConversionStatus.SKIPPED
     assert "state.pb" in rows[0].result.reason
     assert namespace.read_bytes("store.json") == b"original core state"
+
+
+def test_conversion_header_records_the_live_schema_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The committed goldens pin these hashes, so this is where the live ones are checked."""
+    project, journal = journal_at(tmp_path, monkeypatch)
+    record_trace(journal)
+    convert_run(project, "run-1", clock=ManualClock(), threads=SimThreads())
+    with Project.run_log_path_for(project.root, "run-1").open("rb") as stream:
+        header = next(iter(RunLogReader(stream))).body
+    assert header is not None
+    assert header.field == "epoch_started"
+    assert header.value.api_schema_hash == API_SCHEMA_HASH
+    assert header.value.store_schema_hash == STORE_SCHEMA_HASH
 
 
 def test_gateway_conversion_fixture_regenerates_identically(

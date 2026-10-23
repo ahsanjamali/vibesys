@@ -290,7 +290,7 @@ depends_on = ["server.host_envelope", "server.host_machine_facts"]
 [[modules]]
 # The host helper's MachineProbe on a real host: hardware, Docker, harness CLIs, checkouts.
 path = "server.host_helper_machine"
-depends_on = ["server.host_api", "server.host_machine_facts", "vs_sim.api"]
+depends_on = ["server.host_api", "server.host_compatibility_generated", "server.host_machine_facts", "vs_sim.api"]
 
 [[modules]]
 # What a run's tile draws (per-idea points, attention reason): contracts only. Pydantic only.
@@ -312,7 +312,7 @@ depends_on = ["vs_decode.api", "server.host_api", "server.host_run_dashboard", "
 [[modules]]
 # The host helper's interfaces on a real host: projects, directories, launches, the checkout.
 path = "server.host_helper_os"
-depends_on = ["server.host_examples", "server.host_agent_logins", "vs_decode.api", "server.host_api", "server.host_helper_logs", "server.host_helper_machine", "server.host_helper_preflight", "server.host_preflight", "server.host_helper_requests", "server.host_run_events", "server.run_digest", "server.span_index", "server.run_summary", "server.run_summary_cache", "vs_logs", "vs_project", "vs_sim.api"]
+depends_on = ["vs_runlog", "server.host_saved_runs", "vs_proto", "server.host_examples", "server.host_agent_logins", "vs_decode.api", "server.host_api", "server.host_helper_logs", "server.host_helper_machine", "server.host_helper_preflight", "server.host_preflight", "server.host_helper_requests", "server.host_run_events", "server.run_digest", "server.span_index", "server.run_summary", "server.run_summary_cache", "vs_logs", "vs_project", "vs_sim.api"]
 
 [[modules]]
 # A run's summary: the fold of its journal that the run level shows, as a pure read model.
@@ -1427,7 +1427,7 @@ expose = ["NativeProfilerPreflight", "ProfilerPreflight", "SessionAgents", "Sess
 [[modules]]
 path = "vs_core"
 layer = "prompts_and_lower_libs"
-depends_on = ["vs_proto", "vs_core._corevalue", "vs_core._generated", "vs_core._dispatch_episode", "vs_core._session_checkpoints", "vs_core._session_rows", "vs_core._session_scope", "vs_core._turn_outcomes", "vs_core._proofs", "vs_core._waits", "vs_core.types", "vs_core.types.common", "vs_core._values", "vs_core._outcomes", "vs_core._generated.vibesys.core.v1.common_cv", "vs_core._generated.vibesys.core.v1.vocabulary_cv"]
+depends_on = ["vs_runlog", "vs_proto", "vs_core._corevalue", "vs_core._generated", "vs_core._dispatch_episode", "vs_core._session_checkpoints", "vs_core._session_rows", "vs_core._session_scope", "vs_core._turn_outcomes", "vs_core._proofs", "vs_core._waits", "vs_core.types", "vs_core.types.common", "vs_core._values", "vs_core._outcomes", "vs_core._generated.vibesys.core.v1.common_cv", "vs_core._generated.vibesys.core.v1.vocabulary_cv"]
 
 [[interfaces]]
 from = ["vs_core"]
@@ -1966,11 +1966,11 @@ expose = ["RunLogTee", "JOURNAL_EVENT_MAX_BYTES"]
 [[modules]]
 path = "vibesys.api.host"
 layer = "prompts_and_lower_libs"
-depends_on = ["vibesys.api", "vibesys.api.chat", "vibesys.api.host_relaunch", "vs_project", "vs_proto", "vs_runlog", "vs_sim.api"]
+depends_on = ["vibesys.api.host_terminate", "vibesys.api", "vibesys.api.chat", "vibesys.api.host_relaunch", "vs_project", "vs_proto", "vs_runlog", "vs_sim.api"]
 
 [[interfaces]]
 from = ["vibesys.api.host"]
-expose = ["host_call"]
+expose = ["host_call", "terminate_host"]
 
 [[modules]]
 path = "vs_core._generated"
@@ -2052,6 +2052,29 @@ from = ["vs_core._generated.vibesys.core.v1.vocabulary_cv"]
 expose = ["[A-Z].*"]
 
 [[modules]]
+path = "vibesys.fact_import"
+layer = "loops"
+depends_on = ["vibesys", "vs_agent", "vs_core", "vs_project", "vs_proto", "vs_decode.api", "vs_runtime", "vs_evaluation.api", "vs_evaluator_protocol", "vibesys.hypothesis", "vibesys.metrics"]
+
+[[interfaces]]
+from = ["vibesys.fact_import"]
+expose = ["api", "api\\..*"]
+
+# The only fact_import code that reads a Project; the importer itself is pure.
+[[modules]]
+path = "vibesys.fact_import.reader"
+layer = "loops"
+depends_on = ["vibesys.fact_import", "vs_core", "vs_project", "vs_proto"]
+
+[[interfaces]]
+from = ["vibesys.fact_import.reader"]
+expose = ["RetainedReadLimits", "read_run_facts"]
+
+[[modules]]
+path = "vibesys.api.importing"
+depends_on = ["vibesys.fact_import", "vibesys.fact_import.reader"]
+
+[[modules]]
 path = "vibesys.api.host_operations"
 depends_on = ["vs_proto", "vibesys.api.host_operations._candidate", "vibesys.api.host_operations._compute", "vibesys.api.host_operations._handlers", "vibesys.api.host_operations._login", "vibesys.api.host_operations._project", "vibesys.api.host_operations._reads", "vibesys.api.host_operations._start"]
 
@@ -2094,3 +2117,28 @@ depends_on = ["server.host_api", "vs_proto"]
 [[interfaces]]
 from = ["server.host_operation_types_generated"]
 expose = ["is_registry_read", "RegistryReadRequest", "UnmigratedHelperRequest"]
+
+[[modules]]
+path = "server.host_compatibility_generated"
+depends_on = []
+
+[[interfaces]]
+from = ["server.host_compatibility_generated"]
+expose = ["MIN_CHECKOUT_VERSION"]
+
+[[modules]]
+path = "server.host_saved_runs"
+depends_on = ["vibesys.api.transport", "vs_project", "vs_proto", "vs_runlog", "vs_sim.api"]
+
+[[interfaces]]
+from = ["server.host_saved_runs"]
+expose = ["page_saved_runs"]
+
+[[modules]]
+path = "vibesys.api.host_terminate"
+layer = "prompts_and_lower_libs"
+depends_on = ["vs_project", "vs_proto", "vs_runlog", "vs_sim.api"]
+
+[[interfaces]]
+from = ["vibesys.api.host_terminate"]
+expose = ["pause_now", "serve_terminate", "terminate_run"]
