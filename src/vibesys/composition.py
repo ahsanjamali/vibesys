@@ -222,6 +222,36 @@ def resolve_agent_specs(  # noqa: PLR0913  # lint-waiver: LW-221002 [PLR0913]; s
     return MappingProxyType(resolved)
 
 
+def resolve_run_agent_specs(  # noqa: PLR0913  # lint-waiver: LW-221003 [PLR0913]; same inputs as resolve_agent_specs, passed through so a zero-role run short-circuits before its strict checks. A wrapper would only rename those inputs.
+    config: Config,
+    roles: tuple[AgentRole, ...],
+    *,
+    backend: AgentBackend | str | None = None,
+    provider: str | None = None,
+    allow_unvetted_model: bool = False,
+    allowed_models: frozenset[str] | None = None,
+    host_settings: Path | None = None,
+) -> Mapping[str, AgentSpec]:
+    """Resolve the agent resources a selected run policy can actually consume.
+
+    A policy that declares no roles has no agent configuration namespace: role
+    overrides belong to the operator's agent strategies and are irrelevant to this
+    run. Role-bearing policies keep the strict resolver above, including its early
+    unknown-role diagnostic.
+    """
+    if not roles:
+        return MappingProxyType({})
+    return resolve_agent_specs(
+        config,
+        roles,
+        backend=backend,
+        provider=provider,
+        allow_unvetted_model=allow_unvetted_model,
+        allowed_models=allowed_models,
+        host_settings=host_settings,
+    )
+
+
 def _host_allowed_models(
     allowed_models: frozenset[str] | None, host_settings: Path | None
 ) -> frozenset[str]:

@@ -11,7 +11,7 @@ import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from vibesys.composition import require_one_login_per_container, resolve_agent_specs
+from vibesys.composition import require_one_login_per_container, resolve_run_agent_specs
 from vibesys.config import BUNDLED_RESOURCES
 from vibesys.inputs import (
     InputBundle,
@@ -162,7 +162,7 @@ def validate_run_request(
     validate_execution_request(
         request, git=git, attribution_command=attribution_command_of(options)
     )
-    specs = resolve_agent_specs(
+    specs = resolve_run_agent_specs(
         request.config,
         registration.plugin.agents,
         backend=request.agent_backend,

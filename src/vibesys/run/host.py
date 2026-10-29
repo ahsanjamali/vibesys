@@ -13,12 +13,13 @@ from vibesys.comparisons.api import (
     stored_comparisons,
     visible_comparison_variables,
 )
-from vibesys.composition import AgentToolContext, agent_spec_from_config, resolve_agent_specs
+from vibesys.composition import AgentToolContext, agent_spec_from_config, resolve_run_agent_specs
 from vibesys.events import CoreEventType, EventStatus, FrameworkSource, FrameworkWarningData
 from vibesys.orchestration.skill_selection import platform_skill_selection
 from vibesys.run.agent_events import CoreAgentEventSink
 from vibesys.run.contracts import ProfilerKind
 from vibesys.run.core_services import (
+    CoreAgentResources,
     CoreCompositionError,
     CoreEnvironment,
     CoreResources,
@@ -178,14 +179,15 @@ class _ProductHostFactory:
                 f"plugin {plugin.id!r}"
             )
             raise ValueError(message)
-        agent_specs = resolve_agent_specs(
+        agent_specs = resolve_run_agent_specs(
             self.request.config,
             plugin.agents,
             backend=self.request.agent_backend,
             provider=self.request.cli_provider,
             allow_unvetted_model=self.request.allow_unvetted_model,
         )
-        _require_supported_fallback(self.request.config.agent.quota.to_policy(), agent_specs)
+        if agent_specs:
+            _require_supported_fallback(self.request.config.agent.quota.to_policy(), agent_specs)
         resources = open_run_resources(
             self.request,
             self.integration,
@@ -202,11 +204,6 @@ class _ProductHostFactory:
         project = resources.project_resources
         environment = resources.environment_resources
         logger = project.logger
-        session_store = DurableSessionStore(
-            project.state.local("agent").slot("sessions.json", AgentSessionState),
-            log=logger.lprint,
-            threads=self.timing.threads,
-        )
         policy = self.plugin.core
         if policy is None:
             message = "core services require a plugin with a core policy"
@@ -253,7 +250,7 @@ class _ProductHostFactory:
         self.facts = resources.facts
         self.comparisons = self._read_comparisons(resources)
         self.core_services = self._core_services(
-            resources, workspace_resources, session_store, agent_runtime, evaluation, ownership
+            resources, workspace_resources, agent_runtime, evaluation, ownership
         )
         if self.core_services.profile_capture_withheld:
             logger.lprint(_NO_PROFILE_CAPTURE_NOTE)
@@ -356,11 +353,10 @@ class _ProductHostFactory:
         }
         return {tool: server for tool, server in served.items() if server is not None}
 
-    def _core_services(  # noqa: PLR0913  # lint-waiver: LW-948090 [PLR0913]; each argument is an independently owned resource the host already opened, and the composition reads them once.
+    def _core_services(
         self,
         resources: _PreparedRun,
         workspace_resources: WorkspaceResourceFactory,
-        session_store: DurableSessionStore,
         agent_runtime: WorkspaceRuntime,
         evaluation: Evaluation,
         ownership: ReleaseStack,
@@ -370,39 +366,12 @@ class _ProductHostFactory:
         if policy is None:
             message = "core services require a plugin with a core policy"
             raise ValueError(message)
-        factory = self.agent_client_factory
-        if factory is None:
-            raise CoreCompositionError(
-                "agent_client_factory", "a core run needs a factory for its agent client"
-            )
-        if self.invocation_store_factory is None:
-            raise CoreCompositionError(
-                "invocation_store_factory", "a core run needs a durable invocation journal"
-            )
         project = resources.project_resources
         workspaces = agent_runtime.workspaces
-        scope = workspace_resources.root.agent_scope()
-        specs = resources.agent_specs
-        base = agent_spec_from_config(
-            self.request.config,
-            backend=self.request.agent_backend,
-            provider=self.request.cli_provider,
-            allow_unvetted_model=self.request.allow_unvetted_model,
-        )
-        events = CoreAgentEventSink(self.integration.events.record, self.timing.clock)
-        agents: dict[str, _ProviderAgents] = {}
-        for provider, spec in _provider_specs(base, specs).items():
-            agents[provider] = self._open_provider_agents(
-                factory, spec, scope, session_store, agent_runtime, events, ownership
-            )
-        turns = ProviderRoutedExecutor(
-            {provider: turn_executor(agent.client) for provider, agent in agents.items()}
-        )
-        # Every core session shares one run-scoped journal, named by a fixed member key.
-        invocations = self.invocation_store_factory(
-            project.state, AgentSessionKey.for_member("core", "run")
-        )
         namespace = project.project.state.local_namespace(project.state.run_id, "core-evaluation")
+        roles, agents, role_models, stateless_servers = self._core_agent_resources(
+            resources, workspace_resources, agent_runtime, namespace, ownership
+        )
         # Each stage's output goes to the run's log store under its gate, named by the
         # measurement's handle and try, as its gate events name it: an in-process stage's as
         # its command prints it, a Slurm stage's as each scheduler poll reads it.
@@ -416,11 +385,6 @@ class _ProductHostFactory:
             stage_output,
             ledger_identity=(project.project.state.load_project().project_id, project.state.run_id),
         )
-        tool_context = _tool_context(
-            resources,
-            self._serve_queue_status(resources, _slurm_handle_root(namespace), ownership),
-        )
-        configuration = partial(self._agent_configuration, resources)
         return build_core_services(
             policy,
             CoreResources(
@@ -447,24 +411,17 @@ class _ProductHostFactory:
                     tries=tries,
                 ),
                 environment=self._core_environment(resources),
-                roles=self._offered_roles(tool_context),
-                role_models={
-                    role: spec.model
-                    for role, spec in specs.items()
-                    if spec.model and spec.model != base.model
-                },
-                agent_turns=turns,
+                roles=roles,
+                role_models=role_models,
+                agents=agents,
                 control=self.integration.control,
-                invocation_slot=invocations,
-                configuration=configuration,
                 clock=self.timing.clock,
                 github=self.integration.github,
                 threads=self.integration.threads,
                 blocking=self.blocking,
                 network=self.network,
-                agent_lifecycle=self.integration.agent_execution_event,
                 evaluation_diagnostics=self._evaluation_diagnostic,
-                stateless_tool_servers=self._stateless_tool_servers(tool_context),
+                stateless_tool_servers=stateless_servers,
                 commands=agent_runtime.commands,
                 capture_commands=agent_runtime.capture_commands,
                 # No round_label: this instance is built once for the run and
@@ -480,6 +437,83 @@ class _ProductHostFactory:
                 commit_observer=self.integration.core_commit_observer(
                     project.state.run_id, self.projector, self.plugin.id
                 ),
+            ),
+        )
+
+    def _core_agent_resources(
+        self,
+        resources: _PreparedRun,
+        workspace_resources: WorkspaceResourceFactory,
+        agent_runtime: WorkspaceRuntime,
+        namespace: StateNamespace,
+        ownership: ReleaseStack,
+    ) -> tuple[
+        tuple[AgentRole, ...],
+        CoreAgentResources | None,
+        dict[str, str],
+        Mapping[str, ToolServerDescriptor],
+    ]:
+        """Resolve offered roles and open their indivisible session bundle, if any.
+
+        A plugin that declares no roles opens no agent environment, provider client,
+        session store, invocation journal, queue status service, or tool servers.
+        """
+        if not self.plugin.agents:
+            return (), None, {}, {}
+        factory = self.agent_client_factory
+        if factory is None:
+            raise CoreCompositionError(
+                "agent_client_factory", "a core run with agent roles needs a client factory"
+            )
+        if self.invocation_store_factory is None:
+            raise CoreCompositionError(
+                "invocation_store_factory",
+                "a core run with agent roles needs a durable invocation journal",
+            )
+        project = resources.project_resources
+        session_store = DurableSessionStore(
+            project.state.local("agent").slot("sessions.json", AgentSessionState),
+            log=project.logger.lprint,
+            threads=self.timing.threads,
+        )
+        scope = workspace_resources.root.agent_scope()
+        specs = resources.agent_specs
+        base = agent_spec_from_config(
+            self.request.config,
+            backend=self.request.agent_backend,
+            provider=self.request.cli_provider,
+            allow_unvetted_model=self.request.allow_unvetted_model,
+        )
+        events = CoreAgentEventSink(self.integration.events.record, self.timing.clock)
+        agents: dict[str, _ProviderAgents] = {}
+        for provider, spec in _provider_specs(base, specs).items():
+            agents[provider] = self._open_provider_agents(
+                factory, spec, scope, session_store, agent_runtime, events, ownership
+            )
+        turns = ProviderRoutedExecutor(
+            {provider: turn_executor(agent.client) for provider, agent in agents.items()}
+        )
+        configuration = partial(self._agent_configuration, resources)
+        # Every core session shares one run-scoped journal, named by a fixed member key.
+        invocations = self.invocation_store_factory(
+            project.state, AgentSessionKey.for_member("core", "run")
+        )
+        tool_context = _tool_context(
+            resources,
+            self._serve_queue_status(resources, _slurm_handle_root(namespace), ownership),
+        )
+        roles = self._offered_roles(tool_context)
+        role_models = {
+            role: spec.model
+            for role, spec in specs.items()
+            if spec.model and spec.model != base.model
+        }
+        return (
+            roles,
+            CoreAgentResources(
+                agent_turns=turns,
+                invocation_slot=invocations,
+                configuration=configuration,
                 session_spec=agent_session_spec(
                     environments={
                         provider: agent.environment for provider, agent in agents.items()
@@ -488,7 +522,10 @@ class _ProductHostFactory:
                     variables=scope.environment_variables,
                     configuration=configuration,
                 ),
+                lifecycle=self.integration.agent_execution_event,
             ),
+            role_models,
+            self._stateless_tool_servers(tool_context),
         )
 
     def _open_provider_agents(  # noqa: PLR0913  # lint-waiver: LW-948091 [PLR0913]; each argument is an independently owned resource the host already opened, and this reads them once per provider.

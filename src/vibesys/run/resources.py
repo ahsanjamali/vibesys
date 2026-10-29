@@ -323,6 +323,12 @@ def open_run_resources(  # noqa: C901, PLR0912, PLR0913, PLR0915  # lint-waiver:
                 request.agent_backend or config.agent.backend or AgentBackend.CLI
             )
             resolved_cli_provider = resolve_provider(config, request.cli_provider)
+            # Preserve the operator's selection for durable metadata and
+            # auxiliary conversations. The run environment itself gets the
+            # inert backend when this policy declares no agent roles, so it
+            # neither validates nor mounts credentials it cannot consume.
+            environment_agent_backend = resolved_backend if agent_specs else str(AgentBackend.STUB)
+            environment_cli_provider = resolved_cli_provider if agent_specs else None
             execution_record = RunExecutionRecord(
                 model=model_name,
                 agent_backend=resolved_backend,
@@ -573,7 +579,7 @@ def open_run_resources(  # noqa: C901, PLR0912, PLR0913, PLR0915  # lint-waiver:
             )
 
             evaluation_socket_mounts = ()
-            if resolved_backend == AgentBackend.CLI:
+            if environment_agent_backend == AgentBackend.CLI:
                 # Agents run in containers that must reach the in-turn evaluation service.
                 socket_mount = evaluation_socket_mount(project_root, run_id)
                 ownership.callback(remove_evaluation_socket, project_root, run_id)
@@ -597,8 +603,8 @@ def open_run_resources(  # noqa: C901, PLR0912, PLR0913, PLR0915  # lint-waiver:
                 seeded_workspace_paths=tuple(source.dest for source in workspace_sources),
                 ref_dir=ref_dir,
                 backend=backend_impl,
-                agent_backend=resolved_backend,
-                cli_provider=resolved_cli_provider,
+                agent_backend=environment_agent_backend,
+                cli_provider=environment_cli_provider,
                 run_id=run_id,
                 clock=clock,
                 system=integration.system,

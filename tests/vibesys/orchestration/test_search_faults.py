@@ -29,10 +29,12 @@ from tests.vibesys.orchestration.multi._host import config as multi_config
 from tests.vibesys.orchestration.single._host import SingleHost
 from tests.vibesys.orchestration.single._host import config as single_config
 from tests.vibesys.search_faults import FAULTS, MAX_STEPS, Step, play, steps, stops
+from tests.vibesys.serial_search._host import SerialHost
 from tests.vibesys.serial_search._replies import attribution
 from tests.vibesys.vibesys_flows import across_restarts
 
 from vibesys.api.catalog import BUILT_INS
+from vibesys.orchestration.input_check.search import InputCheckConfig, check_input
 from vibesys.orchestration.single.search.api import single
 from vibesys.plugin_registration import RuntimeRecordProjector
 from vibesys.run.contracts import IterationTree
@@ -65,6 +67,12 @@ class Search:
 
 
 SEARCHES: dict[str, Search] = {
+    "check-input": Search(
+        lambda _shape, restarting: SerialHost.begin(
+            check_input, InputCheckConfig(), restarting=restarting
+        ),
+        {},
+    ),
     "dynamic": Search(
         lambda shape, restarting: dynamic_begin(dynamic_config(**shape), restarting=restarting),
         {
