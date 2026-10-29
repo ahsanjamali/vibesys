@@ -701,6 +701,7 @@ export type Detail4 = string | null;
  */
 export type FrameworkSource4 = "gates" | "git_tracking" | "loop" | "gpu" | "skypilot" | "other";
 export type SourceLabel2 = string | null;
+export type NewProcessCount = number | null;
 export type Kind47 = "winner_selected";
 export type Selection = "candidate" | "baseline";
 export type Revision3 = string;
@@ -2304,6 +2305,7 @@ export interface FrameworkWarningData {
   detail?: Detail4;
   source?: FrameworkSource4;
   source_label?: SourceLabel2;
+  new_process_count?: NewProcessCount;
 }
 /**
  * The run's result was chosen: a retained candidate, or the unchanged trusted input.
