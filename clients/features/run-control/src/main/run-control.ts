@@ -4,13 +4,14 @@
  * `run.stop`, `instances.list`); each run page's connections are run channels the same connection
  * opens.
  *
- * A run's identity comes from its record (`run_id`), when the app starts or attaches to it; it is
- * never inferred later. Each attached run keeps its own binding, keyed by that `run_id`: attaching,
- * starting, or resuming a run never disturbs a binding under a different key, so one window's run
- * cannot be silently detached by another window's navigation. Whether a run ended comes from the
- * host's pushed registry, a run channel that ended with `run_gone`, or a check that found the run
- * gone. The page keeps its own resume logic but no retry timer: while its page still owns it, a dial
- * waits for the host connection to be ready, and the page is woken when the connection recovers.
+ * A run's identity is its host and the `run_id` from its record, when the app starts or attaches to
+ * it; it is never inferred later. Each attached run keeps its own binding under that composite
+ * identity: attaching, starting, or resuming a run never disturbs a binding under a different key,
+ * so one window's run cannot be silently detached by another window's navigation. Whether a run
+ * ended comes from the host's pushed registry, a run channel that ended with `run_gone`, or a check
+ * that found the run gone. The page keeps its own resume logic but no retry timer: while its page
+ * still owns it, a dial waits for the host connection to be ready, and the page is woken when the
+ * connection recovers.
  *
  * Navigation toward a target (a host and instance id) is tracked separately from bindings, by the
  * same key: a newer attach, start, or resume toward the *same* target supersedes an older one
@@ -39,7 +40,7 @@ import {
   instanceObservation,
 } from '@vibesys/hosts';
 import type {HarnessChoice, ReaderAttached} from '@vibesys/ipc';
-import type {ResumeRunId} from '@vibesys/runs';
+import {type ResumeRunId, type RunRef, runRefKey} from '@vibesys/runs';
 import type {StoredRecentRun} from '@vibesys/settings';
 import {LiveFanout} from './live-fanout.js';
 import {type RelayPort, relay} from './relay.js';
@@ -69,11 +70,8 @@ interface RunPage {
 export interface RunControlDeps {
   /** Lease the one connection to `id`; the caller releases or transfers every lease. */
   connection(id: HostId): Promise<ConnectionLease>;
-  /** Open (or focus an already-open) window for `runId`, titled from `title`. */
-  openPage(
-    runId: string,
-    title: {readonly hostLabel: string; readonly task: string | null},
-  ): RunPage;
+  /** Open (or focus an already-open) window for `run`, titled from `title`. */
+  openPage(run: RunRef, title: {readonly hostLabel: string; readonly task: string | null}): RunPage;
   /** Ask the user; resolves true on "yes". */
   /** Record a run only while `current` says this selection still owns navigation. */
   remember(run: StoredRecentRun, current: () => boolean): Promise<void>;
@@ -86,7 +84,7 @@ export interface RunControlDeps {
 interface Binding {
   readonly id: HostId;
   readonly instanceId: string;
-  readonly runId: string;
+  readonly run: RunRef;
   readonly project: string;
   readonly task: string | null;
   readonly connection: HostConnection;
@@ -153,7 +151,7 @@ interface Launch {
 export class RunControl {
   readonly #liveFanout = new LiveFanout();
   readonly #deps: RunControlDeps;
-  /** Every run bound to a window, by `run_id`. */
+  /** Every run bound to a window, by `(host, run_id)`. */
   readonly #bindings = new Map<string, Binding>();
   /** The claim currently navigating toward (or already bound to) each target, by `targetKey`. */
   readonly #claims = new Map<string, Claim>();
@@ -162,7 +160,7 @@ export class RunControl {
   /** Stale launches held until the matching claim binds or is abandoned. */
   readonly #pendingAdoptions = new Map<string, PendingAdoption>();
   /** The most recently bound run, which a launch from the command line opens a window for. */
-  #lastBoundRunId: string | null = null;
+  #lastBoundRun: RunRef | null = null;
   /** Orders claims by request time; see `Claim.sequence`. */
   #nextSequence = 0;
 
@@ -172,14 +170,14 @@ export class RunControl {
 
   /** The most recently bound run, or null when none is bound. */
   attached(): BoundRun | null {
-    const runId = this.#lastBoundRunId;
-    const run = runId === null ? undefined : this.#bindings.get(runId);
+    const ref = this.#lastBoundRun;
+    const run = ref === null ? undefined : this.#bindings.get(runRefKey(ref));
     if (run === undefined) return null;
     return {
       host: hostKey(run.id),
       hostLabel: hostLabel(run.id),
       instanceId: run.instanceId,
-      runId: run.runId,
+      runId: run.run.runId,
       project: run.project,
       connection: run.status,
     };
@@ -312,11 +310,11 @@ export class RunControl {
   }
 
   /**
-   * Relay one connection `runId`'s run page opened, over a run channel. Message and close listener
+   * Relay one connection `run`'s run page opened, over a run channel. Message and close listener
    * ownership is installed synchronously before this returns.
    */
-  connect(port: RelayPort, runId: string): void {
-    const run = this.#bindings.get(runId);
+  connect(port: RelayPort, ref: RunRef): void {
+    const run = this.#bindings.get(runRefKey(ref));
     if (run === undefined) {
       port.close();
       return;
@@ -343,19 +341,22 @@ export class RunControl {
     }
   }
 
-  /** End `runId`'s page; the run itself keeps going on its host. Safe when `runId` is not bound. */
-  detach(runId: string): void {
-    this.#releaseBinding(runId);
+  /** End `run`'s page; the run itself keeps going on its host. Safe when it is not bound. */
+  detach(run: RunRef): void {
+    this.#releaseBinding(run);
   }
 
-  /** Drop `runId`'s binding, without disturbing any other binding or in-flight navigation. */
-  #releaseBinding(runId: string): void {
-    const run = this.#bindings.get(runId);
+  /** Drop `ref`'s binding, without disturbing any other binding or in-flight navigation. */
+  #releaseBinding(ref: RunRef): void {
+    const key = runRefKey(ref);
+    const run = this.#bindings.get(key);
     if (run === undefined) return;
-    this.#bindings.delete(runId);
-    if (this.#lastBoundRunId === runId) this.#lastBoundRunId = null;
-    const key = targetKey(run.id, run.instanceId);
-    if (this.#claims.get(key) !== undefined) this.#claims.delete(key);
+    this.#bindings.delete(key);
+    if (this.#lastBoundRun !== null && runRefKey(this.#lastBoundRun) === key) {
+      this.#lastBoundRun = null;
+    }
+    const target = targetKey(run.id, run.instanceId);
+    if (this.#claims.get(target) !== undefined) this.#claims.delete(target);
     this.#settleAdoption(run.id, run.instanceId, false);
     let retirement: PromiseLike<void>;
     try {
@@ -499,6 +500,11 @@ export class RunControl {
     return undefined;
   }
 
+  /** Whether `binding` is still the installed owner of its composite run identity. */
+  #ownsBinding(binding: Binding): boolean {
+    return this.#bindings.get(runRefKey(binding.run)) === binding;
+  }
+
   #isIntended(id: HostId, instanceId: string): boolean {
     const claim = this.#claims.get(targetKey(id, instanceId));
     return claim !== undefined && !claim.cancelled;
@@ -537,7 +543,7 @@ export class RunControl {
     record: Pick<LiveInstanceRecord, 'id' | 'run_id' | 'project_root'>,
     task: string | null,
   ): Promise<boolean> {
-    const runId = record.run_id;
+    const run: RunRef = {host: hostKey(id), runId: record.run_id};
     const connection = lease.connection;
     const subscriptions: (() => void)[] = [];
     const pendingObservations: (() => void)[] = [];
@@ -579,12 +585,12 @@ export class RunControl {
         attachedAt: this.#deps.now(),
       });
       if (claim.cancelled) return false;
-      this.#releaseBinding(runId);
-      page = this.#deps.openPage(runId, {hostLabel: hostLabel(id), task});
+      this.#releaseBinding(run);
+      page = this.#deps.openPage(run, {hostLabel: hostLabel(id), task});
       const provisional: Binding = {
         id,
         instanceId: record.id,
-        runId,
+        run,
         project: record.project_root,
         task,
         connection,
@@ -608,19 +614,19 @@ export class RunControl {
           });
         }),
       );
-      this.#bindings.set(runId, provisional);
-      this.#lastBoundRunId = runId;
+      this.#bindings.set(runRefKey(run), provisional);
+      this.#lastBoundRun = run;
       observationPhase = 'live';
       for (const observation of pendingObservations.splice(0)) observation();
       this.#deps.changed();
-      if (claim.cancelled || this.#bindings.get(runId) !== provisional) return false;
+      if (claim.cancelled || !this.#ownsBinding(provisional)) return false;
       installed = true;
       this.#settleAdoption(id, record.id, true);
       return true;
     } finally {
       if (!installed) {
         observationPhase = 'closed';
-        if (binding !== null && this.#bindings.get(runId) === binding) this.#bindings.delete(runId);
+        if (binding !== null && this.#ownsBinding(binding)) this.#bindings.delete(runRefKey(run));
         try {
           leaseRelease = release();
         } finally {
@@ -700,7 +706,7 @@ export class RunControl {
   }
 
   #phase(binding: Binding, phase: Phase): void {
-    if (this.#bindings.get(binding.runId) !== binding || binding.status.kind === 'run-ended') {
+    if (!this.#ownsBinding(binding) || binding.status.kind === 'run-ended') {
       return;
     }
     const recovered = phase.kind === 'ready' && binding.status.kind !== 'connected';
@@ -711,7 +717,7 @@ export class RunControl {
   }
 
   #listing(binding: Binding, listing: InstanceList): void {
-    if (this.#bindings.get(binding.runId) !== binding) return;
+    if (!this.#ownsBinding(binding)) return;
     const observation = instanceObservation(listing, binding.instanceId);
     switch (observation.kind) {
       case 'live':
@@ -730,7 +736,7 @@ export class RunControl {
   }
 
   #ended(binding: Binding): void {
-    if (this.#bindings.get(binding.runId) !== binding || binding.status.kind === 'run-ended') {
+    if (!this.#ownsBinding(binding) || binding.status.kind === 'run-ended') {
       return;
     }
     binding.status = {kind: 'run-ended'};
@@ -739,7 +745,7 @@ export class RunControl {
 
   /** This window's own dial to its run was refused: the host's channel ceiling is spent. */
   #capacityRefused(binding: Binding, detail: string): void {
-    if (this.#bindings.get(binding.runId) !== binding || binding.status.kind === 'run-ended') {
+    if (!this.#ownsBinding(binding) || binding.status.kind === 'run-ended') {
       return;
     }
     binding.status = {kind: 'capacity', detail};

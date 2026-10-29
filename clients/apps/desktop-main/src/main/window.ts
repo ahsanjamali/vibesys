@@ -16,6 +16,7 @@ import {
   WAKE_CHANNEL,
   type WelcomeEvent,
 } from '@vibesys/ipc';
+import {type RunRef, sameRun} from '@vibesys/runs';
 import {BaseWindow, ipcMain, type MessagePortMain, type WebContentsView} from 'electron';
 import {SHELL_URL} from './app-assets.js';
 import {sandboxedView} from './app-security.js';
@@ -59,10 +60,10 @@ export interface AppWindowDeps {
   readonly log: (message: string) => void;
   /** The page the surface loads: the app shell, with a run's query in a run window. */
   readonly surfaceUrl: string;
-  /** The surface opened one connection, for the run bound to the window (`bindRun`'s `runId`). */
-  readonly connect: (port: RelayPort, runId: string) => void;
+  /** The surface opened one connection, for the run bound to the window (`bindRun`'s `run`). */
+  readonly connect: (port: RelayPort, run: RunRef) => void;
   /** The native window or its surface document disappeared: detach the run bound to it. */
-  readonly closed: (runId: string) => void;
+  readonly closed: (run: RunRef) => void;
   /** The surface exhausted its bounded recovery; enter fatal app shutdown. */
   readonly fatal: (error: Error) => void;
   /** The native window's title; `VibeSys` by default. */
@@ -90,7 +91,7 @@ export class AppWindow {
   /** Stable surface-document authority across the one allowed WebContentsView recreation. */
   readonly welcome: WelcomeDocument;
   /** The run bound to the surface, if any; null before one ever bound. */
-  #currentRunId: string | null = null;
+  #currentRun: RunRef | null = null;
   /** Withdraws this window's admission claim from the shared run-connect registry. */
   readonly #unregisterRunIpc: () => void;
 
@@ -132,28 +133,28 @@ export class AppWindow {
     this.#pages.start(sandboxedView('welcome.cjs'));
     this.#unregisterRunIpc = runIpcRegistry(deps.log).register({
       currentSenderId: () =>
-        this.#currentRunId === null ? null : (this.#pages.current?.webContents.id ?? null),
+        this.#currentRun === null ? null : (this.#pages.current?.webContents.id ?? null),
       // The registry only admits a port whose sender is this window's surface while a run is
-      // bound, so `#currentRunId` names the same run this port's connection is for.
+      // bound, so `#currentRun` names the same run this port's connection is for.
       connect: port => {
-        const runId = this.#currentRunId;
-        if (runId === null) {
+        const run = this.#currentRun;
+        if (run === null) {
           port.close();
           return;
         }
-        this.#deps.connect(port, runId);
+        this.#deps.connect(port, run);
       },
     });
   }
 
   /**
-   * Bind `runId` to the surface: the shell shows the run in its own document, so the layout stays.
+   * Bind `run` to the surface: the shell shows the run in its own document, so the layout stays.
    * A different run bound before is detached first. The returned handle wakes the surface's session
    * and unbinds the run.
    */
-  bindRun(runId: string): {wake(): void; close(): void} {
-    if (this.#currentRunId !== runId) this.#detachCurrentRun();
-    this.#currentRunId = runId;
+  bindRun(run: RunRef): {wake(): void; close(): void} {
+    if (this.#currentRun === null || !sameRun(this.#currentRun, run)) this.#detachCurrentRun();
+    this.#currentRun = run;
     return {
       wake: () => {
         const surface = this.#pages.current;
@@ -162,7 +163,7 @@ export class AppWindow {
         }
       },
       close: () => {
-        if (this.#currentRunId === runId) this.#currentRunId = null;
+        if (this.#currentRun !== null && sameRun(this.#currentRun, run)) this.#currentRun = null;
       },
     };
   }
@@ -222,10 +223,10 @@ export class AppWindow {
 
   /** Report the bound run's loss, if it has one; safe before any run ever bound. */
   #detachCurrentRun(): void {
-    const runId = this.#currentRunId;
-    if (runId === null) return;
-    this.#currentRunId = null;
-    this.#deps.closed(runId);
+    const run = this.#currentRun;
+    if (run === null) return;
+    this.#currentRun = null;
+    this.#deps.closed(run);
   }
 
   /** The surface fills the window. */
