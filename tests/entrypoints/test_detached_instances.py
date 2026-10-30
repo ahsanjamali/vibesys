@@ -566,6 +566,10 @@ def test_the_launcher_routes_detached_runs_to_python() -> None:
     assert headless_command(["--detach"])[2] == "entrypoints.server"
 
 
+def test_the_launcher_routes_input_checks_to_python() -> None:
+    assert headless_command(["check-input"])[2] == "entrypoints.headless"
+
+
 def test_the_launcher_lists_instances_in_process_without_a_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

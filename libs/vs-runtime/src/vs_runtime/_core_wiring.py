@@ -28,7 +28,7 @@ from vs_core.api import (
     validate_startup,
 )
 from vs_runtime._core_loop import CoreRuntimeBindings
-from vs_runtime._core_requests import RequestExecutors
+from vs_runtime._core_requests import ExecutorRole, RefusingRequestExecution, RequestExecutors
 from vs_runtime._evaluation_requests import MeasurementRequests
 from vs_runtime._evidence_ledger import ReceiptEvidenceLedger
 from vs_runtime._measurement_progress import (
@@ -49,7 +49,7 @@ from vs_runtime._workspace_requests import RuntimeWorkspaceRequests
 
 if TYPE_CHECKING:
     from vs_agent.api import ClientAgentSessions
-    from vs_core.api import Continuation, DispatchTurn, LifecycleCapability
+    from vs_core.api import Continuation, DispatchTurn, LifecycleCapability, SnapshotAndRetainRun
     from vs_evaluation.api import PollingEvaluationExecutor
     from vs_project.api import StateNamespace
     from vs_runtime._run_control import RunControlChannel
@@ -82,6 +82,14 @@ class SessionServices:
     resolver: SessionResolver
     yields: TurnYields[DispatchTurn, Continuation] | None = None
     """Turns that asked to wait; None when no tool lets an agent yield."""
+
+
+class _NoRunInvocations:
+    """Refuse a run snapshot that claims an invocation when sessions are not bound."""
+
+    def unproven(self, request: SnapshotAndRetainRun) -> str:
+        del request
+        return "the run has no bound session executor, so no invocation can be proven terminal"
 
 
 def empty_catalog() -> OperationCatalog:
@@ -150,18 +158,22 @@ def core_bindings(  # noqa: PLR0913  # lint-waiver: LW-260141 [PLR0913]; the run
     receipts: StateNamespace,
     workspaces: RuntimeWorkspaces,
     measurement: MeasurementServices,
-    sessions: SessionServices,
+    sessions: SessionServices | None = None,
     threads: Threads,
     blocking: BlockingRunner,
     operations: OperationCatalog | None = None,
 ) -> CoreRuntimeBindings:
     """Bind every request role over one shared receipt store.
 
-    The session role is ``session_executors``: EnsureSession, DispatchTurn and
-    InspectTurn go to its ``turns`` executor, CancelTurn, CloseSession and
-    ResumeSessionTurn to its ``lifecycle`` executor, both over one access settlement.
-    The same agent sessions also prove, for the workspace executor, that a run turn's
-    writer ended (settled, or interrupted and released) before the run is snapshotted.
+    When ``sessions`` is supplied, the session role is ``session_executors``:
+    EnsureSession, DispatchTurn and InspectTurn go to its ``turns`` executor,
+    CancelTurn, CloseSession and ResumeSessionTurn to its ``lifecycle`` executor,
+    both over one access settlement. The same agent sessions also prove, for the
+    workspace executor, that a run turn's writer ended (settled, or interrupted and
+    released) before the run is snapshotted. When ``sessions`` is absent, session
+    requests use the runtime's explicit unbound-role refusal and invocation snapshots
+    have no terminal-writer proof. This is the production composition for a policy
+    that declares no agent roles.
     ``operations`` defaults to the empty catalog, which serves a strategy that declares
     no registered operations; pass the same catalog to ``new_core_state(offered=)``.
     ``threads`` locks the receipt store; ``blocking`` runs the executors' synchronous
@@ -169,21 +181,23 @@ def core_bindings(  # noqa: PLR0913  # lint-waiver: LW-260141 [PLR0913]; the run
     """
     store = ReceiptStore(receipts, threads)
     catalog = operations or empty_catalog()
-    session = session_executors(
-        sessions.agent_sessions,
-        sessions.resolver,
-        store,
-        sessions.yields,
-        blocking,
-    )
-    proof = ReleasedRunInvocations(
-        JournalRunInvocations(sessions.agent_sessions, store), sessions.agent_sessions, store
-    )
+    if sessions is None:
+        session = None
+        session_requests = RefusingRequestExecution(ExecutorRole.SESSIONS)
+        proof = _NoRunInvocations()
+    else:
+        session = session_executors(
+            sessions.agent_sessions, sessions.resolver, store, sessions.yields, blocking
+        )
+        session_requests = SessionRequestRouter(session.turns, session.lifecycle)
+        proof = ReleasedRunInvocations(
+            JournalRunInvocations(sessions.agent_sessions, store), sessions.agent_sessions, store
+        )
     executors = RequestExecutors(
         workspaces=RuntimeWorkspaceRequests(
             workspaces, store, proof, blocking, ReceiptEvidenceLedger(store)
         ),
-        sessions=SessionRequestRouter(session.turns, session.lifecycle),
+        sessions=session_requests,
         evaluation=MeasurementRequests(
             measurement.executor,
             store,
@@ -197,5 +211,7 @@ def core_bindings(  # noqa: PLR0913  # lint-waiver: LW-260141 [PLR0913]; the run
         semantic_events=JournalSemanticEvents(store, receipts),
     )
     return CoreRuntimeBindings(
-        registry=catalog.registry, executors=executors, steering=session.turns
+        registry=catalog.registry,
+        executors=executors,
+        steering=None if session is None else session.turns,
     )

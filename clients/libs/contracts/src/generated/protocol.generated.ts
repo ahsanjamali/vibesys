@@ -537,10 +537,6 @@ export type Kind23 = "judge_result";
 export type Verdict1 = "pass" | "fail";
 export type Feedback = string;
 export type Attempt3 = number;
-export type Skipped = boolean;
-export type SkipReason = string | null;
-export type ImplementerOutcome =
-  ("continue" | "supported" | "nominated" | "disproven" | "implementation_failed") | null;
 export type Kind24 = "benchmark_result";
 export type Metric1 = string;
 export type Value1 = number;
@@ -693,8 +689,6 @@ export type Objective = string | null;
 export type SearchPolicy = string | null;
 export type BenchmarkContract = boolean;
 export type ParetoObjectives = string | null;
-export type MaxContinuationRounds = number | null;
-export type MaxUnmeasuredTurns = number | null;
 /**
  * Closed set of framework subsystems that emit framework events.
  */
@@ -707,6 +701,7 @@ export type Detail4 = string | null;
  */
 export type FrameworkSource4 = "gates" | "git_tracking" | "loop" | "gpu" | "skypilot" | "other";
 export type SourceLabel2 = string | null;
+export type NewProcessCount = number | null;
 export type Kind47 = "winner_selected";
 export type Selection = "candidate" | "baseline";
 export type Revision3 = string;
@@ -765,8 +760,6 @@ export type Hosts = string[];
 export type Reason10 = string | null;
 export type Comparisons = ComparisonReadingData[];
 export type Kind51 = "workstream_finished";
-export type SetupFailure = boolean;
-export type Refunded = boolean;
 export type RepeatedError = boolean;
 /**
  * Why a workstream ended without a measured candidate. Closed.
@@ -1939,18 +1932,12 @@ export interface SubprocessOutputData {
 }
 /**
  * Verdict and feedback returned by the judge.
- *
- * See ``vibesys.events.JudgeResultData`` for ``skipped``/``skip_reason``/
- * ``implementer_outcome``.
  */
 export interface JudgeResultData {
   kind: Kind23;
   verdict: Verdict1;
   feedback: Feedback;
   attempt: Attempt3;
-  skipped?: Skipped;
-  skip_reason?: SkipReason;
-  implementer_outcome?: ImplementerOutcome;
 }
 /**
  * Metric result emitted by a benchmark stage.
@@ -2294,9 +2281,6 @@ export interface WorkspaceSnapshotData {
 }
 /**
  * One per run: the resolved configuration a loop starts with.
- *
- * See ``vibesys.events.RunConfiguredData`` for ``max_continuation_rounds``/
- * ``max_unmeasured_turns``.
  */
 export interface RunConfiguredData {
   kind: Kind45;
@@ -2307,8 +2291,6 @@ export interface RunConfiguredData {
   search_policy?: SearchPolicy;
   benchmark_contract?: BenchmarkContract;
   pareto_objectives?: ParetoObjectives;
-  max_continuation_rounds?: MaxContinuationRounds;
-  max_unmeasured_turns?: MaxUnmeasuredTurns;
   source?: FrameworkSource3;
 }
 /**
@@ -2323,6 +2305,7 @@ export interface FrameworkWarningData {
   detail?: Detail4;
   source?: FrameworkSource4;
   source_label?: SourceLabel2;
+  new_process_count?: NewProcessCount;
 }
 /**
  * The run's result was chosen: a retained candidate, or the unchanged trusted input.
@@ -2400,14 +2383,11 @@ export interface ComparisonReadingData {
  * Wire summary for one projected, recorded policy round and its typed failure, if any.
  *
  * See ``vibesys.events.WorkstreamFinishedData`` for the generic producer's
- * serial and dynamic behavior. Its current round projection always reports
- * ``setup_failure`` and ``refunded`` as ``False``; in the dynamic policy
- * specifically, profile and merge workstreams do not emit this event.
+ * serial and dynamic behavior; in the dynamic policy specifically, profile
+ * and merge workstreams do not emit this event.
  */
 export interface WorkstreamFinishedData {
   kind: Kind51;
-  setup_failure: SetupFailure;
-  refunded: Refunded;
   repeated_error: RepeatedError;
   last_error?: WorkstreamFailureData | null;
 }
@@ -2768,6 +2748,7 @@ export interface NarrationLine {
   traceback?: Traceback;
 }
 export interface SpanAttributes {
+  "check-input"?: CheckInputSpanAttributes | null;
   dynamic?: DynamicSpanAttributes | null;
   evolve?: EvolveSpanAttributes | null;
   "multi-agent"?: MultiAgentSpanAttributes | null;
@@ -2776,7 +2757,7 @@ export interface SpanAttributes {
   "profile-guided-single-agent"?: ProfileGuidedSingleAgentSpanAttributes | null;
   "single-agent"?: SingleAgentSpanAttributes | null;
 }
-export interface DynamicSpanAttributes {
+export interface CheckInputSpanAttributes {
   adoption?: AdoptionAttrs | null;
   agent_turn?: AgentTurnAttrs | null;
   gate?: GateAttrs | null;
@@ -2885,6 +2866,13 @@ export interface WorkstreamAttrs {
   summary?: Summary5;
   probe?: Probe;
   sequence?: Sequence2;
+}
+export interface DynamicSpanAttributes {
+  adoption?: AdoptionAttrs | null;
+  agent_turn?: AgentTurnAttrs | null;
+  gate?: GateAttrs | null;
+  planning_call?: PlanningAttrs | null;
+  workstream?: WorkstreamAttrs | null;
 }
 export interface EvolveSpanAttributes {
   adoption?: AdoptionAttrs | null;
